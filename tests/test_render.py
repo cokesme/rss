@@ -74,3 +74,18 @@ class AtomEscapingTest(unittest.TestCase):
         self.assertEqual(set(link_el.attrib), {"href"})
         self.assertEqual(entry.find(f"{ATOM}id").text, link)
         self.assertEqual(entry.find(f"{ATOM}title").text, '<b>"t"</b> & co')
+
+
+class PageHeadTest(unittest.TestCase):
+    def test_csp_and_referrer_meta(self):
+        feeds = [{"title": "F", "slug": "f", "items": [item("https://example.com/")]}]
+        for depth in (0, 1):
+            with self.subTest(depth=depth):
+                out = build.page("T", "", feeds, None, NOW, depth=depth)
+                head = out.split("</head>", 1)[0]
+                self.assertIn(
+                    '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
+                    'style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'">', head)
+                self.assertIn('<meta name="referrer" content="no-referrer">', head)
+                self.assertIn("<style>", head)
+                self.assertNotIn("<script", out)

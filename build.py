@@ -158,6 +158,9 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:.8rem}
 """
 
 
+CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+
+
 def page(title: str, body: str, feeds, active: str | None, now: datetime, depth: int = 0) -> str:
     up = "../" * depth
     chips = [f'<a href="{up}index.html" class="{"on" if active is None else ""}">All</a>']
@@ -169,6 +172,8 @@ def page(title: str, body: str, feeds, active: str | None, now: datetime, depth:
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{CSP}">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <link rel="alternate" type="application/atom+xml" title="{html.escape(SITE_TITLE)}" href="{up}atom.xml">
 <style>{CSS}</style>
