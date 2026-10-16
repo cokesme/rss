@@ -8,6 +8,7 @@ import html
 import http.client
 import io
 import ipaddress
+import multiprocessing
 import os
 import re
 import shutil
@@ -36,6 +37,8 @@ USER_AGENT = "static-rss-reader/1.0 (+https://github.com)"
 FETCH_TIMEOUT = 20       # seconds per socket operation, and for the whole body
 MAX_FEED_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
+PARSE_TIMEOUT = 20       # seconds to parse one feed (in a child process)
+PARSE_MEMORY = 512 * 1024 * 1024  # address-space cap for that process
 ALLOW_PRIVATE = os.environ.get("RSS_ALLOW_PRIVATE") == "1"  # allow non-public IPs (local testing)
 
 
@@ -220,18 +223,65 @@ def download(url: str) -> tuple[bytes, dict]:
                             "content-type": resp.headers.get("content-type", "")}
 
 
+def _parse_child(conn):
+    args = conn.recv()
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (PARSE_MEMORY, PARSE_MEMORY))
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        result = ("ok", parse_feed(*args))
+    except BaseException as exc:  # noqa: BLE001
+        result = ("error", clean(exc) or type(exc).__name__)
+    try:
+        conn.send(result)
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def parse_isolated(*args) -> dict:
+    """Run parse_feed in a child process with a wall-clock limit and a memory cap.
+
+    feedparser has super-linear regexes that hold the GIL and an unbounded entity
+    expansion in its fallback parser, so threads and socket timeouts can't contain it.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(target=_parse_child, args=(child_conn,), daemon=True)
+    proc.start()
+    child_conn.close()  # so a dead child shows up as EOF/EPIPE here instead of a hang
+    try:
+        conn.send(args)  # over the pipe, not as Process args: those block forever if the child dies early
+        if not conn.poll(PARSE_TIMEOUT):
+            raise TimeoutError(f"parsing took over {PARSE_TIMEOUT}s")
+        status, value = conn.recv()
+    except (EOFError, BrokenPipeError):
+        raise RuntimeError("parser process died (out of memory?)") from None
+    finally:
+        conn.close()
+        proc.kill()
+        proc.join()
+    if status != "ok":
+        raise ValueError(value)
+    return value
+
+
 def fetch(url_and_name):
     url, name = url_and_name
     try:
         data, headers = download(url)
-        # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
-        d = feedparser.parse(io.BytesIO(data), response_headers=headers)
+        return {"url": url, **parse_isolated(data, headers, url, name)}
     except Exception as exc:  # noqa: BLE001
         return {"url": url, "error": clean(exc) or type(exc).__name__, "items": [], "title": name or url}
 
+
+def parse_feed(data: bytes, headers: dict, url: str, name: str | None) -> dict:
+    # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
+    d = feedparser.parse(io.BytesIO(data), response_headers=headers)
     if d.bozo and not d.entries:
         err = getattr(d, "bozo_exception", "could not parse feed")
-        return {"url": url, "error": clean(err) or "could not parse feed", "items": [], "title": name or url}
+        return {"error": clean(err) or "could not parse feed", "items": [], "title": name or url}
 
     title = name or d.feed.get("title") or url
     site = sanitize_link(d.feed.get("link"), url)  # url is already known to be http(s)
@@ -247,7 +297,7 @@ def fetch(url_and_name):
             "summary": truncate(strip_html(summary), SUMMARY_CHARS),
             "feed": title,
         })
-    return {"url": url, "title": title, "site": site, "items": items, "error": None}
+    return {"title": title, "site": site, "items": items, "error": None}
 
 
 # ---------- rendering ----------
