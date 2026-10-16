@@ -1,4 +1,5 @@
 import sys
+import time
 import unittest
 import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
@@ -89,3 +90,36 @@ class PageHeadTest(unittest.TestCase):
                 self.assertIn('<meta name="referrer" content="no-referrer">', head)
                 self.assertIn("<style>", head)
                 self.assertNotIn("<script", out)
+
+
+class StripHtmlTest(unittest.TestCase):
+    def test_redos_unclosed_script_tags(self):
+        raw = "<script>" * 200_000
+        start = time.perf_counter()
+        self.assertEqual(build.strip_html(raw), "")
+        self.assertLess(time.perf_counter() - start, 1.0)
+        start = time.perf_counter()
+        build.strip_html("<style>" * 100_000 + "x" + "<b>" * 100_000)
+        self.assertLess(time.perf_counter() - start, 1.0)
+
+    def test_cases(self):
+        cases = {
+            None: "",
+            "": "",
+            "plain text": "plain text",
+            "Tom &amp; Jerry &lt;3 &#39;hi&#x27; &eacute; &nbsp;x": "Tom & Jerry <3 'hi' é x",
+            "<p>Hello <b>wor<i>ld</i></b></p><p>next</p>": "Hello wor ld next",
+            "a<br>b<br/>c": "a b c",
+            "a<!-- hidden -->b": "a b",
+            "before<script>alert('x<b>')</script>after": "before after",
+            "x<SCRIPT type='t'>evil()</SCRIPT>y": "x y",
+            "x<style>p{color:red}</style>y": "x y",
+            "<script>a</script>keep<script>b</script>": "keep",
+            "ok<script>never closed <p>text": "ok",
+            "  lots \n\t of   space  ": "lots of space",
+            "a < b and c > d": "a < b and c > d",
+            "<a href='x'>link</a> text": "link text",
+        }
+        for raw, expected in cases.items():
+            with self.subTest(raw=raw):
+                self.assertEqual(build.strip_html(raw), expected)

@@ -11,6 +11,7 @@ import sys
 import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -34,11 +35,37 @@ def slugify(text: str) -> str:
     return s[:60] or "feed"
 
 
+class _TextExtractor(HTMLParser):
+    """Linear-time tag stripper: tags become spaces, <script>/<style> bodies are dropped."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip = tag
+        self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag == self.skip:
+            self.skip = None
+        self.parts.append(" ")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+    def handle_comment(self, data):
+        self.parts.append(" ")
+
+
 def strip_html(raw: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    p = _TextExtractor()
+    p.feed(raw or "")
+    p.close()
+    return re.sub(r"\s+", " ", "".join(p.parts)).strip()
 
 
 def is_safe_http_url(url: str) -> bool:
