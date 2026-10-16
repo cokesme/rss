@@ -105,7 +105,10 @@ def entry_time(e) -> datetime | None:
     for key in ("published_parsed", "updated_parsed", "created_parsed"):
         t = e.get(key)
         if t:
-            return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
+            try:
+                return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
+            except (ValueError, OverflowError, OSError):  # feedparser can return year 0 or 10000
+                continue
     return None
 
 
