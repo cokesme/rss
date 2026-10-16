@@ -13,6 +13,17 @@ feedparser has no known unpatched CVEs. Its five published advisories are all fr
   - **Memory exhaustion (F5).** A 68 KB feed expands to 300 MB of text, with about 890 MiB peak RSS.
   - **Whole-build abort from feed dates (F6).** feedparser returns year 0 or year 10000 dates. `entry_time()` runs outside the per-feed `try`, so the whole build crashes.
 
+**Status update (2026-10-16, branch `security-hardening`).** F3–F6 are now fixed, and each fix was checked against the reproducers below:
+
+- **F3, F4, F5:** commit 8213006 runs `parse_feed()` in a spawned child process limited to 20 s (`PARSE_TIMEOUT`) and 512 MiB of address space (`PARSE_MEMORY`).
+    - Both entity-amplification inputs (68 KB and 148 KB) fail with `MemoryError` in 0.1 s.
+    - The 26 KB XML-declaration input and the 1 MB author-email input are killed at 20 s.
+    - In a build with four such feeds and one normal feed, the normal feed still builds. The whole build takes 20.1 s, because the timeouts run in parallel.
+    - A legitimate 4 MiB feed with 50 items parses within the memory cap.
+- **F6:** commit 7cde9f8 makes `entry_time()` skip out-of-range dates and fall back to the next date field.
+
+Tests for both fixes are in `tests/test_parse.py`.
+
 **Scope correction.** feedparser 6.0.14 depends on `feedparser-sgmllib>=2,<3`, not `sgmllib3k`. The change came in 6.0.13 (see feedparser's NEWS file). Today this installs `feedparser-sgmllib` 2.1.0. `sgmllib3k` is no longer installed. The earlier advice to pin `sgmllib3k==1.0.0` (in `security-review.md` §4.3) is obsolete.
 
 ## Scope
@@ -290,6 +301,8 @@ sgmllib3k 1.0.0 was a 2010, sdist-only Python 3 port of sgmllib, so pip ran its 
 | `HTMLParser`-based `strip_html()` | build-side regex ReDoS (not a feedparser issue) | feedparser's own regexes (F3, F4) |
 | `clean()` and `html.escape` on errors | F10 | — |
 | Planned hash pinning | F12 drift and tampering | Upstream bugs in the pinned versions |
+| `parse_isolated()`: a child process with a 20 s limit and a 512 MiB address-space cap (added after this review, 8213006) | F3, F4, F5 | CPU time up to the limit on each run |
+| `entry_time()` skips out-of-range dates (added after this review, 7cde9f8) | F6 | — |
 
 ## Recommendations
 
