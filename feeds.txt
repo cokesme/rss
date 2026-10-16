@@ -2,3 +2,4 @@
 # Lines starting with # are ignored.
 
 https://maggieappleton.com/rss.xml Maggie Hugo
+https://nolanlawson.com/feed/ Nolan Platform chat
