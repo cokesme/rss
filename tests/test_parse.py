@@ -1,5 +1,6 @@
 import io
 import sys
+import tempfile
 import time
 import unittest
 import unittest.mock
@@ -72,3 +73,45 @@ class IsolatedParseTest(unittest.TestCase):
             r = build.fetch(("https://ex.com/feed", "Slow"))
         self.assertEqual(r["items"], [])
         self.assertIn("parsing took over", r["error"])
+
+
+class ExternalEntityTest(unittest.TestCase):
+    """No form of external entity may pull local files into the output.
+
+    Two layers stop this today, both upstream: feedparser's replace_doctype() drops
+    SYSTEM entity declarations (but only when they start a line), and expat runs with
+    external entities disabled. This guards against either changing in a dependency bump.
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        tmp = tempfile.TemporaryDirectory()
+        cls.addClassCleanup(tmp.cleanup)
+        cls.marker = "LOCAL-FILE-CONTENT-7f3a"
+        cls.text = Path(tmp.name, "secret.txt")
+        cls.text.write_text(cls.marker)
+        cls.dtd = Path(tmp.name, "evil.dtd")
+        cls.dtd.write_text(f'<!ENTITY leak "{cls.marker}">')
+
+    def assertNoLeak(self, doc: str):
+        r = build.parse_feed(doc.encode(), {"content-type": "application/rss+xml"}, "https://ex.com/feed", None)
+        self.assertNotIn(self.marker, repr(r))
+
+    def body(self, ref: str) -> str:
+        return (f"<rss version='2.0'><channel><title>{ref}</title><link>https://ex.com/</link>"
+                f"<item><title>{ref}</title><link>https://ex.com/1</link><description>{ref}</description></item>"
+                "</channel></rss>")
+
+    def test_general_entity_one_line(self):  # replace_doctype() misses this; only expat's setting stops it
+        self.assertNoLeak(f'<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY x SYSTEM "{self.text.as_uri()}">]>' + self.body("&x;"))
+
+    def test_general_entity_multi_line(self):
+        self.assertNoLeak(f'<?xml version="1.0"?>\n<!DOCTYPE rss [\n<!ENTITY x SYSTEM "{self.text.as_uri()}">\n]>\n' + self.body("&x;"))
+
+    def test_external_dtd(self):
+        self.assertNoLeak(f'<?xml version="1.0"?><!DOCTYPE rss SYSTEM "{self.dtd.as_uri()}">' + self.body("&leak;"))
+        self.assertNoLeak(f'<?xml version="1.0"?>\n<!DOCTYPE rss SYSTEM "{self.dtd.as_uri()}">\n' + self.body("&leak;"))
+
+    def test_parameter_entity(self):
+        self.assertNoLeak(f'<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY % p SYSTEM "{self.dtd.as_uri()}"> %p;]>' + self.body("&leak;"))
+        self.assertNoLeak(f'<?xml version="1.0"?>\n<!DOCTYPE rss [\n<!ENTITY % p SYSTEM "{self.dtd.as_uri()}">\n%p;\n]>\n' + self.body("&leak;"))
