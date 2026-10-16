@@ -9,7 +9,6 @@ import http.client
 import io
 import ipaddress
 import multiprocessing
-import os
 import re
 import shutil
 import socket
@@ -39,7 +38,7 @@ MAX_FEED_BYTES = 5 * 1024 * 1024
 MAX_REDIRECTS = 5
 PARSE_TIMEOUT = 20       # seconds to parse one feed (in a child process)
 PARSE_MEMORY = 512 * 1024 * 1024  # address-space cap for that process
-ALLOW_PRIVATE = os.environ.get("RSS_ALLOW_PRIVATE") == "1"  # allow non-public IPs (local testing)
+ALLOW_PRIVATE = False    # tests patch this to reach their own loopback server; not configurable
 
 
 # ---------- helpers ----------

@@ -1,7 +1,9 @@
 import http.server
 import io
 import ipaddress
+import os
 import socket
+import subprocess
 import sys
 import tempfile
 import threading
@@ -169,9 +171,15 @@ class SSRFTest(FetchTestBase):
         with fake_dns({"feed.example.com": "127.0.0.1"}):
             self.assertRefused(self.fetch(f"http://feed.example.com:{port}/feed.xml"))
 
-    def test_escape_hatch_allows_private(self):
+    def test_allow_private_flag_used_by_tests(self):
         with mock.patch.object(build, "ALLOW_PRIVATE", True):
             self.assertIsNone(self.fetch("/feed.xml")["error"])
+
+    def test_no_environment_escape_hatch(self):
+        env = {**os.environ, "RSS_ALLOW_PRIVATE": "1"}
+        out = subprocess.run([sys.executable, "-c", "import build; print(build.ALLOW_PRIVATE)"],
+                             cwd=Path(build.__file__).parent, env=env, capture_output=True, text=True, check=True)
+        self.assertEqual(out.stdout.strip(), "False")
 
     def test_connection_pinned_to_validated_address(self):
         # The hostname is only resolved once (by the check) and the socket goes to that address.
