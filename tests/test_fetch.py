@@ -1,4 +1,6 @@
 import http.server
+import ipaddress
+import socket
 import sys
 import threading
 import time
@@ -67,8 +69,14 @@ class FetchTestBase(unittest.TestCase):
         cls.srv.shutdown()
         cls.srv.server_close()
 
+    def setUp(self):
+        self.srv.hits.clear()
+        p = mock.patch.object(build, "ALLOW_PRIVATE", True)  # the test server is on loopback
+        p.start()
+        self.addCleanup(p.stop)
+
     def fetch(self, path_or_url: str) -> dict:
-        url = path_or_url if "://" in path_or_url else self.base + path_or_url
+        url = self.base + path_or_url if path_or_url.startswith("/") else path_or_url
         return build.fetch((url, None))
 
 
@@ -110,6 +118,86 @@ class FetchLimitsTest(FetchTestBase):
         r = self.fetch("/big")
         self.assertIn("exceeds", r["error"])
         self.assertEqual(r["items"], [])
+
+
+def fake_dns(table: dict):
+    real = socket.getaddrinfo
+
+    def getaddrinfo(host, port, *a, **kw):
+        if host in table:
+            return [(socket.AF_INET, socket.SOCK_STREAM, 6, "", (table[host], port))]
+        return real(host, port, *a, **kw)
+    return mock.patch.object(socket, "getaddrinfo", getaddrinfo)
+
+
+class SSRFTest(FetchTestBase):
+    def setUp(self):
+        super().setUp()
+        p = mock.patch.object(build, "ALLOW_PRIVATE", False)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def assertRefused(self, r: dict, needle: str = "non-public"):
+        self.assertIn(needle, r["error"])
+        self.assertEqual(r["items"], [])
+        self.assertEqual(self.srv.hits, [])
+
+    def test_ip_classification(self):
+        blocked = ["127.0.0.1", "10.1.2.3", "172.16.0.1", "192.168.1.1", "169.254.169.254",
+                   "100.64.0.1", "0.0.0.0", "224.0.0.1", "240.0.0.1", "255.255.255.255",
+                   "::1", "::", "fe80::1", "fc00::1", "ff02::1", "::ffff:127.0.0.1",
+                   "::ffff:10.0.0.1", "2002:7f00:1::1"]
+        for ip in blocked:
+            self.assertFalse(build.ip_allowed(ipaddress.ip_address(ip)), ip)
+        for ip in ["93.184.216.34", "1.1.1.1", "2606:4700:4700::1111"]:
+            self.assertTrue(build.ip_allowed(ipaddress.ip_address(ip)), ip)
+
+    def test_loopback_url_refused(self):
+        self.assertRefused(self.fetch("/feed.xml"))
+
+    def test_public_looking_host_resolving_to_loopback_refused(self):
+        port = self.srv.server_address[1]
+        with fake_dns({"feed.example.com": "127.0.0.1"}):
+            self.assertRefused(self.fetch(f"http://feed.example.com:{port}/feed.xml"))
+
+    def test_escape_hatch_allows_private(self):
+        with mock.patch.object(build, "ALLOW_PRIVATE", True):
+            self.assertIsNone(self.fetch("/feed.xml")["error"])
+
+    def test_connection_pinned_to_validated_address(self):
+        # The hostname is only resolved once (by the check) and the socket goes to that address.
+        port = self.srv.server_address[1]
+        with mock.patch.object(build, "ALLOW_PRIVATE", True), fake_dns({"pinned.test": "127.0.0.1"}):
+            r = self.fetch(f"http://pinned.test:{port}/blog/feed.xml")
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["items"][0]["link"], f"http://pinned.test:{port}/blog/posts/1.html")
+
+    def test_non_http_schemes_refused(self):
+        for url in ["file:///etc/passwd", "ftp://example.com/feed.xml", "data:,x", "/etc/passwd"]:
+            r = build.fetch((url, None))
+            self.assertIn("only http(s)", r["error"], url)
+
+    def allow_only_server(self):
+        real = build.ip_allowed
+        return mock.patch.object(build, "ip_allowed", lambda ip: str(ip) == "127.0.0.1" or real(ip))
+
+    def test_redirect_to_private_ip_refused(self):
+        port = self.srv.server_address[1]
+        with self.allow_only_server():
+            r = self.fetch(f"/redirect?to=http://127.0.0.2:{port}/internal")
+        self.assertRefused(r)
+
+    def test_redirect_to_host_resolving_private_refused(self):
+        with self.allow_only_server(), fake_dns({"internal.test": "10.0.0.5"}), \
+                mock.patch.object(socket, "create_connection", wraps=socket.create_connection) as cc:
+            r = self.fetch("/redirect?to=http://internal.test/secret")
+        self.assertRefused(r)
+        self.assertEqual(len(cc.call_args_list), 1)  # only the initial, allowed connection
+
+    def test_redirect_to_non_http_refused(self):
+        with self.allow_only_server():
+            self.assertRefused(self.fetch("/redirect?to=ftp://example.com/x"), "refusing redirect")
+            self.assertRefused(self.fetch("/redirect?to=file:///etc/passwd"), "not allowed")  # urllib's own check
 
 
 if __name__ == "__main__":
