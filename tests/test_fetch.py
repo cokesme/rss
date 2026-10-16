@@ -1,4 +1,5 @@
 import http.server
+import gzip
 import io
 import ipaddress
 import os
@@ -9,6 +10,7 @@ import tempfile
 import threading
 import time
 import unittest
+import zlib
 from pathlib import Path
 from unittest import mock
 
@@ -42,6 +44,15 @@ class Handler(http.server.BaseHTTPRequestHandler):
                     time.sleep(0.1)
             except OSError:
                 pass
+            return
+        if self.path == "/gz":
+            self.server.accept_encoding = self.headers.get("Accept-Encoding")
+            body = gzip.compress(RSS.format(title="Zipped", link="posts/1.html").encode())
+            self.send_response(200)
+            self.send_header("Content-Type", "application/rss+xml")
+            self.send_header("Content-Encoding", "gzip")
+            self.end_headers()
+            self.wfile.write(body)
             return
         if self.path == "/big":
             body = b"<rss>" + b" " * (build.MAX_FEED_BYTES + 10)
@@ -124,6 +135,13 @@ class FetchLimitsTest(FetchTestBase):
             r = self.fetch("/drip")
         self.assertLess(time.monotonic() - t, 2.5)
         self.assertIn("took over", r["error"])
+
+    def test_gzip_response_decoded(self):
+        r = self.fetch("/gz")
+        self.assertIsNone(r["error"])
+        self.assertEqual(r["title"], "Zipped")
+        self.assertEqual(r["items"][0]["link"], self.base + "/posts/1.html")
+        self.assertEqual(self.srv.accept_encoding, "gzip, deflate")
 
     def test_oversized_body_rejected(self):
         r = self.fetch("/big")
@@ -215,6 +233,51 @@ class SSRFTest(FetchTestBase):
         with self.allow_only_server():
             self.assertRefused(self.fetch("/redirect?to=ftp://example.com/x"), "refusing redirect")
             self.assertRefused(self.fetch("/redirect?to=file:///etc/passwd"), "not allowed")  # urllib's own check
+
+
+class DecodeBodyTest(unittest.TestCase):
+    FEED = RSS.format(title="T", link="a").encode()
+
+    def test_encodings(self):
+        raw = zlib.compressobj(wbits=-15)
+        raw = raw.compress(self.FEED) + raw.flush()
+        for enc, data in [("", self.FEED), ("identity", self.FEED), ("gzip", gzip.compress(self.FEED)),
+                          ("x-gzip", gzip.compress(self.FEED)), (" GZIP ", gzip.compress(self.FEED)),
+                          ("deflate", zlib.compress(self.FEED)), ("deflate", raw),
+                          ("gzip", gzip.compress(self.FEED[:50]) + gzip.compress(self.FEED[50:]))]:
+            self.assertEqual(build.decode_body(data, enc), self.FEED, enc)
+
+    def test_bomb_refused_quickly(self):
+        bomb = gzip.compress(b"\0" * (200 * 1024 * 1024), 9)  # ~200 KB on the wire
+        t = time.monotonic()
+        with self.assertRaisesRegex(ValueError, "decompressed"):
+            build.decode_body(bomb, "gzip")
+        self.assertLess(time.monotonic() - t, 2)
+
+    def test_exactly_at_limit_allowed(self):
+        data = b"a" * build.MAX_FEED_BYTES
+        self.assertEqual(len(build.decode_body(gzip.compress(data), "gzip")), build.MAX_FEED_BYTES)
+        with self.assertRaises(ValueError):
+            build.decode_body(gzip.compress(data + b"a"), "gzip")
+
+    def test_bad_input_raises_value_error_or_zlib_error(self):
+        with self.assertRaisesRegex(ValueError, "unsupported Content-Encoding"):
+            build.decode_body(b"x", "br")
+        with self.assertRaisesRegex(ValueError, "unsupported"):
+            build.decode_body(b"x", "gzip, gzip")
+        with self.assertRaisesRegex(ValueError, "truncated"):
+            build.decode_body(gzip.compress(self.FEED)[:-12], "gzip")
+        with self.assertRaises(zlib.error):
+            build.decode_body(b"not gzip at all", "gzip")
+
+    def test_bad_encoding_becomes_feed_error(self):
+        with mock.patch.object(build.urllib.request.OpenerDirector, "open") as op:
+            resp = op.return_value.__enter__.return_value
+            resp.read1.side_effect = [b"junk", b""]
+            resp.headers = {"content-encoding": "gzip"}
+            r = build.fetch(("https://ex.com/feed", None))
+        self.assertEqual(r["items"], [])
+        self.assertTrue(r["error"])
 
 
 class SanitizeTest(unittest.TestCase):

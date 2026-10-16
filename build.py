@@ -16,6 +16,7 @@ import sys
 import time
 import urllib.parse
 import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -200,6 +201,29 @@ def clean(value) -> str:
     return re.sub(r"[\x00-\x1f\x7f-\x9f  ]+", " ", str(value)).lstrip(": ").rstrip()
 
 
+def decode_body(data: bytes, encoding: str) -> bytes:
+    """Undo Content-Encoding gzip/deflate, refusing more than MAX_FEED_BYTES of output."""
+    enc = encoding.strip().lower()
+    if enc in ("", "identity"):
+        return data
+    if enc in ("gzip", "x-gzip"):
+        wbits = 31
+    elif enc == "deflate":  # meant to be zlib-wrapped, but some servers send raw deflate
+        wbits = 15 if len(data) > 1 and data[0] & 0x0F == 8 and int.from_bytes(data[:2], "big") % 31 == 0 else -15
+    else:
+        raise ValueError(f"unsupported Content-Encoding {clean(encoding)!r}")
+    out = bytearray()
+    while data:  # loops only for multi-member gzip
+        d = zlib.decompressobj(wbits)
+        out += d.decompress(data, MAX_FEED_BYTES + 1 - len(out))
+        if len(out) > MAX_FEED_BYTES:
+            raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes decompressed")
+        if not d.eof:
+            raise ValueError("truncated compressed feed")
+        data = d.unused_data if wbits == 31 else b""
+    return bytes(out)
+
+
 def download(url: str) -> tuple[bytes, dict]:
     if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
         raise ValueError("only http(s) feed URLs are allowed")
@@ -207,7 +231,7 @@ def download(url: str) -> tuple[bytes, dict]:
     for h in (PinnedHTTPHandler(), PinnedHTTPSHandler(), SafeRedirectHandler(),
               urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
         opener.add_handler(h)
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # no Accept-Encoding
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"})
     deadline = time.monotonic() + FETCH_TIMEOUT
     with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
         buf = bytearray()
@@ -217,9 +241,10 @@ def download(url: str) -> tuple[bytes, dict]:
                 raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes")
             if time.monotonic() > deadline:
                 raise TimeoutError(f"feed download took over {FETCH_TIMEOUT}s")
+        body = decode_body(bytes(buf), resp.headers.get("content-encoding", ""))
         # content-location keeps relative links resolving against the (final) feed URL
-        return bytes(buf), {"content-location": resp.geturl(),
-                            "content-type": resp.headers.get("content-type", "")}
+        return body, {"content-location": resp.geturl(),
+                      "content-type": resp.headers.get("content-type", "")}
 
 
 def _parse_child(conn):
