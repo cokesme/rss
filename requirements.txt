@@ -1,1 +1,12 @@
-feedparser>=6.0
+# Install with: pip install --require-hashes -r requirements.txt
+# Every dependency (including transitive ones) is pinned with hashes for
+# all distribution files on PyPI (wheel + sdist), from the PyPI JSON API.
+#
+# feedparser 6.0.13+ depends on feedparser-sgmllib (>=2,<3), which replaced
+# sgmllib3k. See feedparser's NEWS file.
+feedparser==6.0.14 \
+    --hash=sha256:e35e3f760151b0c3b22cac9684155cae186a233e16c49bcbc6c49e91e3131137 \
+    --hash=sha256:088679b0c4b543ee211a820dd544698c76a402122eae7473c04a43425f283d06
+feedparser-sgmllib==2.1.0 \
+    --hash=sha256:2cab2d43b95a954f920f18aebce7a4dbbb3f539780b127e2aa114f579821e01d \
+    --hash=sha256:61facf2918c4389b5b00714f76c5e03431ffcd94cd1f51d657edd6cd7c396579

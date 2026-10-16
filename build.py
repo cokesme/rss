@@ -4,12 +4,23 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import html
+import http.client
+import io
+import ipaddress
+import multiprocessing
 import re
 import shutil
+import socket
 import sys
+import time
+import urllib.parse
+import urllib.request
+import zlib
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -24,6 +35,12 @@ MAX_ITEMS = 300          # items on the front page
 MAX_PER_FEED = 50        # items kept per feed
 SUMMARY_CHARS = 280
 USER_AGENT = "static-rss-reader/1.0 (+https://github.com)"
+FETCH_TIMEOUT = 20       # seconds per socket operation, and for the whole body
+MAX_FEED_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
+PARSE_TIMEOUT = 20       # seconds to parse one feed (in a child process)
+PARSE_MEMORY = 512 * 1024 * 1024  # address-space cap for that process
+ALLOW_PRIVATE = False    # tests patch this to reach their own loopback server; not configurable
 
 
 # ---------- helpers ----------
@@ -33,11 +50,53 @@ def slugify(text: str) -> str:
     return s[:60] or "feed"
 
 
+class _TextExtractor(HTMLParser):
+    """Linear-time tag stripper: tags become spaces, <script>/<style> bodies are dropped."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip = tag
+        self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag == self.skip:
+            self.skip = None
+        self.parts.append(" ")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+    def handle_comment(self, data):
+        self.parts.append(" ")
+
+
 def strip_html(raw: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    p = _TextExtractor()
+    p.feed(raw or "")
+    p.close()
+    return re.sub(r"\s+", " ", "".join(p.parts)).strip()
+
+
+def is_safe_http_url(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
+def sanitize_link(url: str | None, fallback: str | None = "#") -> str:
+    """Return url if it is http(s) with a host, else fallback if it is, else '#'."""
+    for u in ((url or "").strip(), (fallback or "").strip()):
+        if is_safe_http_url(u):
+            return u
+    return "#"
 
 
 def truncate(text: str, n: int) -> str:
@@ -50,7 +109,10 @@ def entry_time(e) -> datetime | None:
     for key in ("published_parsed", "updated_parsed", "created_parsed"):
         t = e.get(key)
         if t:
-            return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
+            try:
+                return datetime.fromtimestamp(calendar.timegm(t), tz=timezone.utc)
+            except (ValueError, OverflowError, OSError):  # feedparser can return year 0 or 10000
+                continue
     return None
 
 
@@ -83,32 +145,193 @@ def read_feed_list() -> list[tuple[str, str | None]]:
 
 # ---------- fetching ----------
 
+def ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 6:
+        ip = ip.ipv4_mapped or ip.sixtofour or ip
+    return ALLOW_PRIVATE or (ip.is_global and not ip.is_multicast)
+
+
+def public_addrs(host: str, port: int) -> list[tuple]:
+    """Resolve host; refuse if any address is non-public."""
+    addrs = [sa[:2] for *_, sa in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+    for ip, _ in addrs:
+        if not ip_allowed(ipaddress.ip_address(ip)):
+            raise OSError(f"refusing non-public address {ip} for {host!r}")
+    return addrs
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    # Check and connect use the same DNS answer, so DNS rebinding can't get past the check.
+    # HTTPS still wraps with server_hostname=self.host, so SNI and cert checks use the name.
+    def connect(self):
+        err = None
+        for addr in public_addrs(self.host, self.port):
+            try:
+                self.sock = socket.create_connection(addr, self.timeout, self.source_address)
+                return
+            except OSError as exc:
+                err = exc
+        raise err or OSError(f"no address for {self.host!r}")
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection, PinnedHTTPConnection):
+    pass  # MRO: HTTPSConnection.connect -> PinnedHTTPConnection.connect -> TLS wrap
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(PinnedHTTPConnection, req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PinnedHTTPSConnection, req, context=self._context)
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() not in ("http", "https"):
+            raise OSError(f"refusing redirect to {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def clean(value) -> str:
+    """One line with no control characters and no leading '::' (a GitHub Actions command)."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f  ]+", " ", str(value)).lstrip(": ").rstrip()
+
+
+def decode_body(data: bytes, encoding: str) -> bytes:
+    """Undo Content-Encoding gzip/deflate, refusing more than MAX_FEED_BYTES of output."""
+    enc = encoding.strip().lower()
+    if enc in ("", "identity"):
+        return data
+    if enc in ("gzip", "x-gzip"):
+        wbits = 31
+    elif enc == "deflate":  # meant to be zlib-wrapped, but some servers send raw deflate
+        wbits = 15 if len(data) > 1 and data[0] & 0x0F == 8 and int.from_bytes(data[:2], "big") % 31 == 0 else -15
+    else:
+        raise ValueError(f"unsupported Content-Encoding {clean(encoding)!r}")
+    out = bytearray()
+    while data:  # loops only for multi-member gzip
+        d = zlib.decompressobj(wbits)
+        out += d.decompress(data, MAX_FEED_BYTES + 1 - len(out))
+        if len(out) > MAX_FEED_BYTES:
+            raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes decompressed")
+        if not d.eof:
+            raise ValueError("truncated compressed feed")
+        data = d.unused_data if wbits == 31 else b""
+    return bytes(out)
+
+
+def download(url: str) -> tuple[bytes, dict]:
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        raise ValueError("only http(s) feed URLs are allowed")
+    opener = urllib.request.OpenerDirector()  # no proxy, file, ftp or data handlers
+    for h in (PinnedHTTPHandler(), PinnedHTTPSHandler(), SafeRedirectHandler(),
+              urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
+        opener.add_handler(h)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT, "Accept-Encoding": "gzip, deflate"})
+    deadline = time.monotonic() + FETCH_TIMEOUT
+    with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
+        buf = bytearray()
+        while chunk := resp.read1(65536):
+            buf += chunk
+            if len(buf) > MAX_FEED_BYTES:
+                raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"feed download took over {FETCH_TIMEOUT}s")
+        body = decode_body(bytes(buf), resp.headers.get("content-encoding", ""))
+        # content-location keeps relative links resolving against the (final) feed URL
+        return body, {"content-location": resp.geturl(),
+                      "content-type": resp.headers.get("content-type", "")}
+
+
+def _parse_child(conn):
+    args = conn.recv()
+    try:
+        import resource
+        resource.setrlimit(resource.RLIMIT_AS, (PARSE_MEMORY, PARSE_MEMORY))
+    except (ImportError, ValueError, OSError):
+        pass
+    try:
+        result = ("ok", parse_feed(*args))
+    except BaseException as exc:  # noqa: BLE001
+        result = ("error", clean(exc) or type(exc).__name__)
+    try:
+        conn.send(result)
+    except BaseException:  # noqa: BLE001
+        pass
+
+
+def parse_isolated(*args) -> dict:
+    """Run parse_feed in a child process with a wall-clock limit and a memory cap.
+
+    feedparser has super-linear regexes that hold the GIL and an unbounded entity
+    expansion in its fallback parser, so threads and socket timeouts can't contain it.
+    """
+    ctx = multiprocessing.get_context("spawn")
+    conn, child_conn = ctx.Pipe()
+    proc = ctx.Process(target=_parse_child, args=(child_conn,), daemon=True)
+    proc.start()
+    child_conn.close()  # so a dead child shows up as EOF/EPIPE here instead of a hang
+    try:
+        conn.send(args)  # over the pipe, not as Process args: those block forever if the child dies early
+        if not conn.poll(PARSE_TIMEOUT):
+            raise TimeoutError(f"parsing took over {PARSE_TIMEOUT}s")
+        status, value = conn.recv()
+    except (EOFError, BrokenPipeError):
+        raise RuntimeError("parser process died (out of memory?)") from None
+    finally:
+        conn.close()
+        proc.kill()
+        proc.join()
+    if status != "ok":
+        raise ValueError(value)
+    return value
+
+
 def fetch(url_and_name):
     url, name = url_and_name
     try:
-        d = feedparser.parse(url, agent=USER_AGENT)
+        data, headers = download(url)
+        return {"url": url, **parse_isolated(data, headers, url, name)}
     except Exception as exc:  # noqa: BLE001
-        return {"url": url, "error": str(exc), "items": [], "title": name or url}
+        return {"url": url, "error": clean(exc) or type(exc).__name__, "items": [], "title": name or url}
 
+
+def entry_id(feed_url: str, e, item: dict) -> str:
+    """Stable Atom id, namespaced by feed so one feed can't reuse another feed's entry ids."""
+    date = item["date"].isoformat() if item["date"] else ""
+    key = (e.get("id") or e.get("link") or f"{item['title']}\n{date}\n{item['summary']}").strip()
+    return "urn:sha1:" + hashlib.sha1(f"{feed_url}\n{key}".encode()).hexdigest()
+
+
+def parse_feed(data: bytes, headers: dict, url: str, name: str | None) -> dict:
+    # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
+    d = feedparser.parse(io.BytesIO(data), response_headers=headers)
     if d.bozo and not d.entries:
         err = getattr(d, "bozo_exception", "could not parse feed")
-        return {"url": url, "error": str(err), "items": [], "title": name or url}
+        return {"error": clean(err) or "could not parse feed", "items": [], "title": name or url}
 
     title = name or d.feed.get("title") or url
-    site = d.feed.get("link") or url
+    site = sanitize_link(d.feed.get("link"), url)  # url is already known to be http(s)
     items = []
     for e in d.entries[:MAX_PER_FEED]:
         summary = e.get("summary") or ""
         if not summary and e.get("content"):
             summary = e.content[0].get("value", "")
-        items.append({
+        item = {
             "title": strip_html(e.get("title", "")) or "(untitled)",
-            "link": e.get("link") or site,
+            "link": sanitize_link(e.get("link"), site),
             "date": entry_time(e),
             "summary": truncate(strip_html(summary), SUMMARY_CHARS),
             "feed": title,
-        })
-    return {"url": url, "title": title, "site": site, "items": items, "error": None}
+        }
+        item["id"] = entry_id(url, e, item)
+        items.append(item)
+    return {"title": title, "site": site, "items": items, "error": None}
 
 
 # ---------- rendering ----------
@@ -141,6 +364,9 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:.8rem}
 """
 
 
+CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+
+
 def page(title: str, body: str, feeds, active: str | None, now: datetime, depth: int = 0) -> str:
     up = "../" * depth
     chips = [f'<a href="{up}index.html" class="{"on" if active is None else ""}">All</a>']
@@ -152,6 +378,8 @@ def page(title: str, body: str, feeds, active: str | None, now: datetime, depth:
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{CSP}">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <link rel="alternate" type="application/atom+xml" title="{html.escape(SITE_TITLE)}" href="{up}atom.xml">
 <style>{CSS}</style>
@@ -182,21 +410,25 @@ def render_items(items, now: datetime, show_feed=True, depth=0) -> str:
             meta.append(f'<time datetime="{iso}">{rel_time(it["date"], now)}</time>')
         summary = f'<p class="sum">{html.escape(it["summary"])}</p>' if it["summary"] else ""
         out.append(
-            f'<article><h2><a href="{html.escape(it["link"], quote=True)}" rel="noopener">'
+            f'<article><h2><a href="{html.escape(sanitize_link(it["link"]), quote=True)}" rel="noopener noreferrer">'
             f'{html.escape(it["title"])}</a></h2>'
             f'<div class="meta">{" · ".join(meta)}</div>{summary}</article>'
         )
     return "\n".join(out) or "<p>No items yet.</p>"
 
 
+ATTR_ENTITIES = {'"': "&quot;"}
+
+
 def render_atom(items, now: datetime) -> str:
     entries = []
     for it in items[:100]:
         updated = (it["date"] or now).isoformat()
+        link = sanitize_link(it["link"])
         entries.append(f"""<entry>
 <title>{xml_escape(it["title"])}</title>
-<link href="{xml_escape(it["link"])}"/>
-<id>{xml_escape(it["link"])}</id>
+<link href="{xml_escape(link, ATTR_ENTITIES)}"/>
+<id>{xml_escape(it.get("id") or link)}</id>
 <updated>{updated}</updated>
 <author><name>{xml_escape(it["feed"])}</name></author>
 <summary>{xml_escape(it["summary"])}</summary>
@@ -248,7 +480,7 @@ def main() -> int:
     err_html = ""
     if errors:
         rows = "".join(
-            f"<li><code>{html.escape(f['url'])}</code> — {html.escape(str(f['error'])[:200])}</li>"
+            f"<li><code>{html.escape(clean(f['url']))}</code> — {html.escape(clean(f['error'])[:200])}</li>"
             for f in errors
         )
         err_html = f'<div class="err"><strong>{len(errors)} feed(s) failed:</strong><ul>{rows}</ul></div>'
@@ -271,7 +503,7 @@ def main() -> int:
     ok = len(feeds) - len(errors)
     print(f"Built {len(all_items)} items from {ok}/{len(feeds)} feeds into {OUT}/")
     for f in errors:
-        print(f"  ! {f['url']}: {f['error']}", file=sys.stderr)
+        print(f"  ! {clean(f['url'])}: {clean(f['error'])}", file=sys.stderr)
     return 0
 
 

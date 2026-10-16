@@ -5,44 +5,87 @@ on:
     - cron: "17 * * * *"   # hourly (offset from :00 to avoid queue delays)
   push:
     branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
+# Least privilege by default; jobs opt in to anything more.
 permissions:
   contents: read
-  pages: write
-  id-token: write
 
+# PRs get their own group so they never cancel or queue behind a deploy. For
+# deploys, keep the run in progress and replace whatever is queued behind it.
 concurrency:
-  group: pages
-  cancel-in-progress: true
+  group: ${{ github.event_name == 'pull_request' && format('pr-{0}', github.ref) || 'pages' }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
-  build:
+  # Runs on PRs, pushes to main and manual runs. The hourly cron skips it: the
+  # code hasn't changed, and a flaky test shouldn't stop the feeds updating.
+  test:
+    if: github.event_name != 'schedule'
     runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
     steps:
-      - uses: actions/checkout@v5
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
 
-      - uses: actions/setup-python@v6
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
         with:
           python-version: "3.12"
           cache: pip
 
-      - run: pip install -r requirements.txt
+      - run: pip install --require-hashes -r requirements.txt
+
+      - run: python -m unittest discover -s tests -v
+
+  build:
+    needs: test
+    # Never on PRs. Otherwise only after the tests pass, or when they were
+    # skipped (the cron).
+    if: >-
+      !cancelled() && github.event_name != 'pull_request' &&
+      (needs.test.result == 'success' || needs.test.result == 'skipped')
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # This job installs third-party packages and parses untrusted remote
+    # feeds, so it gets read-only repository access and nothing else.
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          persist-credentials: false
+
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - run: pip install --require-hashes -r requirements.txt
 
       - run: python build.py
 
-      - uses: actions/configure-pages@v5
-
-      - uses: actions/upload-pages-artifact@v4
+      - uses: actions/upload-pages-artifact@7b1f4a764d45c48632c6b24a0339c27f5614fb0b # v4.0.0
         with:
           path: site
 
   deploy:
     needs: build
+    # Explicit, because the default success() also looks at the skipped test
+    # job on cron runs and would skip the deploy.
+    if: ${{ !cancelled() && needs.build.result == 'success' }}
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      pages: write
+      id-token: write
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
     steps:
       - id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@d6db90164ac5ed86f2b6aed7e0febac5b3c0c03e # v4.0.5

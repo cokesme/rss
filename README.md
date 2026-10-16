@@ -50,6 +50,10 @@ python build.py
 open site/index.html
 ```
 
+Feeds are fetched over `http(s)` only, with a timeout and a 5 MiB size limit. Connections (and redirects) to loopback, private, link-local and other non-public addresses are refused. This can't be turned off, so feeds served from your own machine or LAN can't be read.
+
+Tests: `python -m unittest discover -s tests -v`
+
 
 # Credits
 Claude Opus 5.5
