@@ -83,7 +83,7 @@ Line numbers refer to feedparser 6.0.14 and feedparser-sgmllib 2.1.0.
 | F8 | feedparser `http.py` + stdlib urllib | Mode A: no timeout; `f.read()` unbounded; gzip/deflate bomb (97 KB becomes 100 MB); redirects followed to loopback, private IPs and `ftp://`; 4xx/5xx bodies parsed as feeds | High in mode A | Confirmed, R07 (offline urllib harness) | `http.py:171-172`, `:179-201`, `:48-68` | **Yes**: mode B `download()` makes this not applicable |
 | F9 | feedparser | Mode B without `content-location`: relative links stay relative. A hostile `xml:base` becomes the base unchecked. | Low | Confirmed, R01 | `mixin.py:227-230`; `api.py:236-238` | Yes: `content-location` is passed, and `sanitize_link` requires a host |
 | F10 | feedparser | Attacker text ends up in `bozo_exception` messages (encoding name, Content-Type) | Low | Confirmed, probe | `encodings.py:254`, `:294-296` | Yes: `clean()` and `html.escape` |
-| F11 | feedparser + expat | XXE, external DTDs, parameter entities | None | Confirmed not vulnerable | `api.py:255`; `sanitizer.py:906-943`. The loose parser never resolves external entities. | n/a |
+| F11 | feedparser + expat | XXE, external DTDs, parameter entities | None today. It relies on one upstream setting, so it is regression-tested. | Confirmed not vulnerable. Corrected after review: `replace_doctype()` misses one-line DOCTYPEs. | `api.py:255` (the one control that covers every form); `sanitizer.py:891-895` (line-anchored regexes). The loose parser never resolves external entities. | n/a; covered by `tests/test_parse.py` `ExternalEntityTest` |
 | F12 | supply chain | feedparser-sgmllib is a brand-new package (org and repo created 2026-07-19). feedparser 6.0.14 has no PyPI attestation. No SECURITY.md; open ReDoS reports have no maintainer response. `>=6.0` floats. | Low / informational | Verified, sources below | — | Partly: pin with hashes (planned) |
 | F13 | sgmllib3k | Predecessor. sdist-only, so `setup.py` ran at install. Unmaintained since 2010. | Not applicable (no longer installed) | Verified | `feedparser.egg-info/requires.txt` | n/a |
 | F14 | stdlib (3.12) | Safety depends on the patch level: expat amplification limits, `html.parser` fixes | Informational | Verified locally (expat_2.9.0 enforces the limit; see R06) | — | Log `sys.version` and `pyexpat.EXPAT_VERSION` in CI |
@@ -241,11 +241,13 @@ The in-progress `download()` makes mode A obsolete:
 
 - **F9.** With no base URI (mode B without `content-location`), relative links stay relative ('rel'). A hostile `xml:base` is joined without a check (`mixin.py:229-230`). The in-progress build passes `content-location` and requires an absolute http(s) URL, so this is covered.
 - **F10.** `CharacterEncodingOverride` and `NonXMLContentType` messages include the attacker's encoding name or Content-Type. The build shows `bozo_exception` when a feed has no entries. It is HTML-escaped and passed through `clean()`, so this is covered.
-- **F11.** These are not exploitable:
-  - `feature_external_ges` is disabled (`api.py:255`).
-  - `replace_doctype` removes the DOCTYPE and re-inserts only safe internal entities.
+- **F11.** These are not exploitable today. One correction since this review was written: the protection is narrower than it first appeared.
+  - `feature_external_ges` is disabled (`api.py:255`). In CPython this one setting also controls external DTDs and external parameter entities. It is the only layer that stops every form.
+  - `replace_doctype` removes `<!ENTITY>` declarations and re-inserts only safe internal ones, **but only when the declaration starts a line**. Its regexes use `^\s*` with `re.MULTILINE` (`sanitizer.py:891`, `:895`). A DOCTYPE on the same line as `<?xml …?>` is left untouched.
   - The loose parser never resolves external entities.
-  - Tested: `<!ENTITY xxe SYSTEM "file:///etc/hostname">` with a parameter-entity DTD fetch gave a title of literally `A&xxe;B` in both the strict and loose paths.
+  - The original test gave a title of literally `A&xxe;B`. The leftover `&xxe;` means `replace_doctype` had already removed the declaration, so the DOCTYPE was probably on its own line, and that test didn't check expat's setting.
+  - Re-tested 2026-10-16 with external entities forced on in expat. One-line general entities, external DTDs and parameter entities then leaked local file contents; the multi-line forms were still blocked by `replace_doctype`.
+  - `tests/test_parse.py` (`ExternalEntityTest`) now covers all six forms and fails if the expat setting changes. See also `security-review-validation.md`, "External entities (XXE)".
 
 ### F12 — supply chain and maintenance (Verified)
 
