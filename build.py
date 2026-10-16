@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import calendar
+import hashlib
 import html
 import http.client
 import io
@@ -300,6 +301,13 @@ def fetch(url_and_name):
         return {"url": url, "error": clean(exc) or type(exc).__name__, "items": [], "title": name or url}
 
 
+def entry_id(feed_url: str, e, item: dict) -> str:
+    """Stable Atom id, namespaced by feed so one feed can't reuse another feed's entry ids."""
+    date = item["date"].isoformat() if item["date"] else ""
+    key = (e.get("id") or e.get("link") or f"{item['title']}\n{date}\n{item['summary']}").strip()
+    return "urn:sha1:" + hashlib.sha1(f"{feed_url}\n{key}".encode()).hexdigest()
+
+
 def parse_feed(data: bytes, headers: dict, url: str, name: str | None) -> dict:
     # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
     d = feedparser.parse(io.BytesIO(data), response_headers=headers)
@@ -314,13 +322,15 @@ def parse_feed(data: bytes, headers: dict, url: str, name: str | None) -> dict:
         summary = e.get("summary") or ""
         if not summary and e.get("content"):
             summary = e.content[0].get("value", "")
-        items.append({
+        item = {
             "title": strip_html(e.get("title", "")) or "(untitled)",
             "link": sanitize_link(e.get("link"), site),
             "date": entry_time(e),
             "summary": truncate(strip_html(summary), SUMMARY_CHARS),
             "feed": title,
-        })
+        }
+        item["id"] = entry_id(url, e, item)
+        items.append(item)
     return {"title": title, "site": site, "items": items, "error": None}
 
 
@@ -418,7 +428,7 @@ def render_atom(items, now: datetime) -> str:
         entries.append(f"""<entry>
 <title>{xml_escape(it["title"])}</title>
 <link href="{xml_escape(link, ATTR_ENTITIES)}"/>
-<id>{xml_escape(link)}</id>
+<id>{xml_escape(it.get("id") or link)}</id>
 <updated>{updated}</updated>
 <author><name>{xml_escape(it["feed"])}</name></author>
 <summary>{xml_escape(it["summary"])}</summary>

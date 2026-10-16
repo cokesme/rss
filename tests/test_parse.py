@@ -4,6 +4,8 @@ import tempfile
 import time
 import unittest
 import unittest.mock
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
 from html import escape as html_escape
 from pathlib import Path
 
@@ -115,3 +117,32 @@ class ExternalEntityTest(unittest.TestCase):
     def test_parameter_entity(self):
         self.assertNoLeak(f'<?xml version="1.0"?><!DOCTYPE rss [<!ENTITY % p SYSTEM "{self.dtd.as_uri()}"> %p;]>' + self.body("&leak;"))
         self.assertNoLeak(f'<?xml version="1.0"?>\n<!DOCTYPE rss [\n<!ENTITY % p SYSTEM "{self.dtd.as_uri()}">\n%p;\n]>\n' + self.body("&leak;"))
+
+
+class AtomIdTest(unittest.TestCase):
+    def ids(self, items: str, url="https://a.example/feed") -> list[str]:
+        data = (f"<?xml version='1.0'?><rss version='2.0'><channel><title>t</title><link>https://a.example/</link>"
+                f"{items}</channel></rss>").encode()
+        return [it["id"] for it in build.parse_feed(data, {}, url, None)["items"]]
+
+    def test_entries_without_links_get_distinct_ids(self):
+        ids = self.ids("<item><title>One</title></item><item><title>Two</title></item>"
+                       "<item><title>x</title><link>javascript:1</link></item><item><title>y</title><link>javascript:2</link></item>")
+        self.assertEqual(len(set(ids)), 4)
+        self.assertTrue(all(i.startswith("urn:sha1:") for i in ids))
+
+    def test_ids_are_stable_and_namespaced_by_feed(self):
+        item = "<item><guid>tag:shared,2026:1</guid><title>x</title></item>"
+        self.assertEqual(self.ids(item), self.ids(item))
+        self.assertNotEqual(self.ids(item), self.ids(item, url="https://b.example/feed"))
+
+    def test_atom_xml_has_unique_ids(self):
+        items = build.parse_feed(("<?xml version='1.0'?><rss version='2.0'><channel><title>t</title>"
+                                  "<item><title>One</title></item><item><title>Two</title></item></channel></rss>").encode(),
+                                 {}, "https://a.example/feed", None)["items"]
+        for it in items:
+            it["slug"] = "t"
+        root = ET.fromstring(build.render_atom(items, datetime.now(timezone.utc)).encode())
+        ids = [e.text for e in root.iter("{http://www.w3.org/2005/Atom}id")][1:]  # skip the feed's own id
+        self.assertEqual(len(ids), 2)
+        self.assertEqual(len(set(ids)), 2)
