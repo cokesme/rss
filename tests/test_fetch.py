@@ -1,7 +1,9 @@
 import http.server
+import io
 import ipaddress
 import socket
 import sys
+import tempfile
 import threading
 import time
 import unittest
@@ -198,6 +200,40 @@ class SSRFTest(FetchTestBase):
         with self.allow_only_server():
             self.assertRefused(self.fetch("/redirect?to=ftp://example.com/x"), "refusing redirect")
             self.assertRefused(self.fetch("/redirect?to=file:///etc/passwd"), "not allowed")  # urllib's own check
+
+
+class SanitizeTest(unittest.TestCase):
+    EVIL = "boom\n::error::x\r\n::warning file=a::y\x1b[31m z"
+
+    def test_clean(self):
+        for s in (self.EVIL, "::error::x", "\n::error::x", " :: ::set-output name=a::b"):
+            out = build.clean(s)
+            self.assertNotRegex(out, r"[\x00-\x1f\x7f ]")
+            self.assertFalse(out.startswith(":"), out)
+        self.assertEqual(build.clean("\n::error::x"), "error::x")
+        self.assertEqual(build.clean(ValueError("a\nb")), "a b")
+
+    def test_fetch_never_raises_and_errors_are_clean(self):
+        for url in ("http://[::1", "http://exa mple.com/\n::error::x", "", "http://"):
+            r = build.fetch((url, None))
+            self.assertTrue(r["error"], url)
+            self.assertNotIn("\n", r["error"])
+
+    def test_main_output_sanitized(self):
+        bad = {"url": "http://e.test/\n::warning::u", "error": self.EVIL, "items": [], "title": "t"}
+        with tempfile.TemporaryDirectory() as tmp, \
+                mock.patch.object(build, "OUT", Path(tmp) / "site"), \
+                mock.patch.object(build, "read_feed_list", lambda: [("x", None)]), \
+                mock.patch.object(build, "fetch", lambda _: dict(bad)), \
+                mock.patch("sys.stderr", new_callable=io.StringIO) as err, \
+                mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(build.main(), 0)
+            index = (Path(tmp) / "site" / "index.html").read_text()
+        lines = err.getvalue().splitlines()
+        self.assertEqual(len(lines), 1)
+        self.assertFalse(any(l.lstrip().startswith("::") for l in lines))
+        self.assertIn("1 feed(s) failed", index)
+        self.assertNotIn("\x1b", index)
 
 
 if __name__ == "__main__":

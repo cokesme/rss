@@ -147,6 +147,11 @@ class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
         return super().redirect_request(req, fp, code, msg, headers, newurl)
 
 
+def clean(value) -> str:
+    """One line with no control characters and no leading '::' (a GitHub Actions command)."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f  ]+", " ", str(value)).lstrip(": ").rstrip()
+
+
 def download(url: str) -> tuple[bytes, dict]:
     if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
         raise ValueError("only http(s) feed URLs are allowed")
@@ -176,11 +181,11 @@ def fetch(url_and_name):
         # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
         d = feedparser.parse(io.BytesIO(data), response_headers=headers)
     except Exception as exc:  # noqa: BLE001
-        return {"url": url, "error": str(exc), "items": [], "title": name or url}
+        return {"url": url, "error": clean(exc) or type(exc).__name__, "items": [], "title": name or url}
 
     if d.bozo and not d.entries:
         err = getattr(d, "bozo_exception", "could not parse feed")
-        return {"url": url, "error": str(err), "items": [], "title": name or url}
+        return {"url": url, "error": clean(err) or "could not parse feed", "items": [], "title": name or url}
 
     title = name or d.feed.get("title") or url
     site = d.feed.get("link") or url
@@ -336,7 +341,7 @@ def main() -> int:
     err_html = ""
     if errors:
         rows = "".join(
-            f"<li><code>{html.escape(f['url'])}</code> — {html.escape(str(f['error'])[:200])}</li>"
+            f"<li><code>{html.escape(clean(f['url']))}</code> — {html.escape(clean(f['error'])[:200])}</li>"
             for f in errors
         )
         err_html = f'<div class="err"><strong>{len(errors)} feed(s) failed:</strong><ul>{rows}</ul></div>'
@@ -359,7 +364,7 @@ def main() -> int:
     ok = len(feeds) - len(errors)
     print(f"Built {len(all_items)} items from {ok}/{len(feeds)} feeds into {OUT}/")
     for f in errors:
-        print(f"  ! {f['url']}: {f['error']}", file=sys.stderr)
+        print(f"  ! {clean(f['url'])}: {clean(f['error'])}", file=sys.stderr)
     return 0
 
 
