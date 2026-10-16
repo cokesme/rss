@@ -43,6 +43,8 @@ class Handler(http.server.BaseHTTPRequestHandler):
             return
         if self.path == "/big":
             body = b"<rss>" + b" " * (build.MAX_FEED_BYTES + 10)
+        elif self.path == "/unsafe":
+            body = RSS.replace("/home", "javascript:alert(2)").format(title="Feed", link="javascript:alert(1)").encode()
         elif self.path == "/latin1":
             body = RSS.format(title="caf\xe9", link="a.html").encode("latin-1")
         else:
@@ -93,6 +95,11 @@ class FetchLimitsTest(FetchTestBase):
         r = self.fetch("/blog/feed.xml")
         self.assertEqual(r["items"][0]["link"], self.base + "/blog/posts/1.html")
         self.assertEqual(r["site"], self.base + "/home")
+
+    def test_unsafe_item_and_channel_links_fall_back_to_feed_url(self):
+        r = self.fetch("/unsafe")
+        self.assertEqual(r["site"], self.base + "/unsafe")
+        self.assertEqual(r["items"][0]["link"], self.base + "/unsafe")
 
     def test_relative_links_resolve_against_final_url_after_redirect(self):
         r = self.fetch("/redirect?to=/blog/sub/feed.xml")

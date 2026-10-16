@@ -231,7 +231,7 @@ def fetch(url_and_name):
         return {"url": url, "error": clean(err) or "could not parse feed", "items": [], "title": name or url}
 
     title = name or d.feed.get("title") or url
-    site = d.feed.get("link") or url
+    site = sanitize_link(d.feed.get("link"), url)  # url is already known to be http(s)
     items = []
     for e in d.entries[:MAX_PER_FEED]:
         summary = e.get("summary") or ""
