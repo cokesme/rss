@@ -8,8 +8,10 @@ import html
 import re
 import shutil
 import sys
+import urllib.parse
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
+from html.parser import HTMLParser
 from pathlib import Path
 from xml.sax.saxutils import escape as xml_escape
 
@@ -33,11 +35,53 @@ def slugify(text: str) -> str:
     return s[:60] or "feed"
 
 
+class _TextExtractor(HTMLParser):
+    """Linear-time tag stripper: tags become spaces, <script>/<style> bodies are dropped."""
+
+    def __init__(self):
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip: str | None = None
+
+    def handle_starttag(self, tag, attrs):
+        if tag in ("script", "style"):
+            self.skip = tag
+        self.parts.append(" ")
+
+    def handle_endtag(self, tag):
+        if tag == self.skip:
+            self.skip = None
+        self.parts.append(" ")
+
+    def handle_data(self, data):
+        if not self.skip:
+            self.parts.append(data)
+
+    def handle_comment(self, data):
+        self.parts.append(" ")
+
+
 def strip_html(raw: str) -> str:
-    text = re.sub(r"(?is)<(script|style).*?</\1>", " ", raw or "")
-    text = re.sub(r"<[^>]+>", " ", text)
-    text = html.unescape(text)
-    return re.sub(r"\s+", " ", text).strip()
+    p = _TextExtractor()
+    p.feed(raw or "")
+    p.close()
+    return re.sub(r"\s+", " ", "".join(p.parts)).strip()
+
+
+def is_safe_http_url(url: str) -> bool:
+    try:
+        parts = urllib.parse.urlsplit(url)
+        return parts.scheme in ("http", "https") and bool(parts.hostname)
+    except ValueError:
+        return False
+
+
+def sanitize_link(url: str | None, fallback: str | None = "#") -> str:
+    """Return url if it is http(s) with a host, else fallback if it is, else '#'."""
+    for u in ((url or "").strip(), (fallback or "").strip()):
+        if is_safe_http_url(u):
+            return u
+    return "#"
 
 
 def truncate(text: str, n: int) -> str:
@@ -103,7 +147,7 @@ def fetch(url_and_name):
             summary = e.content[0].get("value", "")
         items.append({
             "title": strip_html(e.get("title", "")) or "(untitled)",
-            "link": e.get("link") or site,
+            "link": sanitize_link(e.get("link"), site),
             "date": entry_time(e),
             "summary": truncate(strip_html(summary), SUMMARY_CHARS),
             "feed": title,
@@ -141,6 +185,9 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:.8rem}
 """
 
 
+CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+
+
 def page(title: str, body: str, feeds, active: str | None, now: datetime, depth: int = 0) -> str:
     up = "../" * depth
     chips = [f'<a href="{up}index.html" class="{"on" if active is None else ""}">All</a>']
@@ -152,6 +199,8 @@ def page(title: str, body: str, feeds, active: str | None, now: datetime, depth:
     return f"""<!doctype html>
 <html lang="en"><head>
 <meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta http-equiv="Content-Security-Policy" content="{CSP}">
+<meta name="referrer" content="no-referrer">
 <title>{html.escape(title)}</title>
 <link rel="alternate" type="application/atom+xml" title="{html.escape(SITE_TITLE)}" href="{up}atom.xml">
 <style>{CSS}</style>
@@ -182,21 +231,25 @@ def render_items(items, now: datetime, show_feed=True, depth=0) -> str:
             meta.append(f'<time datetime="{iso}">{rel_time(it["date"], now)}</time>')
         summary = f'<p class="sum">{html.escape(it["summary"])}</p>' if it["summary"] else ""
         out.append(
-            f'<article><h2><a href="{html.escape(it["link"], quote=True)}" rel="noopener">'
+            f'<article><h2><a href="{html.escape(sanitize_link(it["link"]), quote=True)}" rel="noopener noreferrer">'
             f'{html.escape(it["title"])}</a></h2>'
             f'<div class="meta">{" · ".join(meta)}</div>{summary}</article>'
         )
     return "\n".join(out) or "<p>No items yet.</p>"
 
 
+ATTR_ENTITIES = {'"': "&quot;"}
+
+
 def render_atom(items, now: datetime) -> str:
     entries = []
     for it in items[:100]:
         updated = (it["date"] or now).isoformat()
+        link = sanitize_link(it["link"])
         entries.append(f"""<entry>
 <title>{xml_escape(it["title"])}</title>
-<link href="{xml_escape(it["link"])}"/>
-<id>{xml_escape(it["link"])}</id>
+<link href="{xml_escape(link, ATTR_ENTITIES)}"/>
+<id>{xml_escape(link)}</id>
 <updated>{updated}</updated>
 <author><name>{xml_escape(it["feed"])}</name></author>
 <summary>{xml_escape(it["summary"])}</summary>
