@@ -5,10 +5,17 @@ from __future__ import annotations
 
 import calendar
 import html
+import http.client
+import io
+import ipaddress
+import os
 import re
 import shutil
+import socket
 import sys
+import time
 import urllib.parse
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from html.parser import HTMLParser
@@ -26,6 +33,10 @@ MAX_ITEMS = 300          # items on the front page
 MAX_PER_FEED = 50        # items kept per feed
 SUMMARY_CHARS = 280
 USER_AGENT = "static-rss-reader/1.0 (+https://github.com)"
+FETCH_TIMEOUT = 20       # seconds per socket operation, and for the whole body
+MAX_FEED_BYTES = 5 * 1024 * 1024
+MAX_REDIRECTS = 5
+ALLOW_PRIVATE = os.environ.get("RSS_ALLOW_PRIVATE") == "1"  # allow non-public IPs (local testing)
 
 
 # ---------- helpers ----------
@@ -127,16 +138,97 @@ def read_feed_list() -> list[tuple[str, str | None]]:
 
 # ---------- fetching ----------
 
+def ip_allowed(ip: ipaddress.IPv4Address | ipaddress.IPv6Address) -> bool:
+    if ip.version == 6:
+        ip = ip.ipv4_mapped or ip.sixtofour or ip
+    return ALLOW_PRIVATE or (ip.is_global and not ip.is_multicast)
+
+
+def public_addrs(host: str, port: int) -> list[tuple]:
+    """Resolve host; refuse if any address is non-public."""
+    addrs = [sa[:2] for *_, sa in socket.getaddrinfo(host, port, type=socket.SOCK_STREAM)]
+    for ip, _ in addrs:
+        if not ip_allowed(ipaddress.ip_address(ip)):
+            raise OSError(f"refusing non-public address {ip} for {host!r}")
+    return addrs
+
+
+class PinnedHTTPConnection(http.client.HTTPConnection):
+    # Check and connect use the same DNS answer, so DNS rebinding can't get past the check.
+    # HTTPS still wraps with server_hostname=self.host, so SNI and cert checks use the name.
+    def connect(self):
+        err = None
+        for addr in public_addrs(self.host, self.port):
+            try:
+                self.sock = socket.create_connection(addr, self.timeout, self.source_address)
+                return
+            except OSError as exc:
+                err = exc
+        raise err or OSError(f"no address for {self.host!r}")
+
+
+class PinnedHTTPSConnection(http.client.HTTPSConnection, PinnedHTTPConnection):
+    pass  # MRO: HTTPSConnection.connect -> PinnedHTTPConnection.connect -> TLS wrap
+
+
+class PinnedHTTPHandler(urllib.request.HTTPHandler):
+    def http_open(self, req):
+        return self.do_open(PinnedHTTPConnection, req)
+
+
+class PinnedHTTPSHandler(urllib.request.HTTPSHandler):
+    def https_open(self, req):
+        return self.do_open(PinnedHTTPSConnection, req, context=self._context)
+
+
+class SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    max_redirections = MAX_REDIRECTS
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        if urllib.parse.urlsplit(newurl).scheme.lower() not in ("http", "https"):
+            raise OSError(f"refusing redirect to {newurl!r}")
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
+def clean(value) -> str:
+    """One line with no control characters and no leading '::' (a GitHub Actions command)."""
+    return re.sub(r"[\x00-\x1f\x7f-\x9f  ]+", " ", str(value)).lstrip(": ").rstrip()
+
+
+def download(url: str) -> tuple[bytes, dict]:
+    if urllib.parse.urlsplit(url).scheme.lower() not in ("http", "https"):
+        raise ValueError("only http(s) feed URLs are allowed")
+    opener = urllib.request.OpenerDirector()  # no proxy, file, ftp or data handlers
+    for h in (PinnedHTTPHandler(), PinnedHTTPSHandler(), SafeRedirectHandler(),
+              urllib.request.HTTPDefaultErrorHandler(), urllib.request.HTTPErrorProcessor()):
+        opener.add_handler(h)
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # no Accept-Encoding
+    deadline = time.monotonic() + FETCH_TIMEOUT
+    with opener.open(req, timeout=FETCH_TIMEOUT) as resp:
+        buf = bytearray()
+        while chunk := resp.read1(65536):
+            buf += chunk
+            if len(buf) > MAX_FEED_BYTES:
+                raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"feed download took over {FETCH_TIMEOUT}s")
+        # content-location keeps relative links resolving against the (final) feed URL
+        return bytes(buf), {"content-location": resp.geturl(),
+                            "content-type": resp.headers.get("content-type", "")}
+
+
 def fetch(url_and_name):
     url, name = url_and_name
     try:
-        d = feedparser.parse(url, agent=USER_AGENT)
+        data, headers = download(url)
+        # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
+        d = feedparser.parse(io.BytesIO(data), response_headers=headers)
     except Exception as exc:  # noqa: BLE001
-        return {"url": url, "error": str(exc), "items": [], "title": name or url}
+        return {"url": url, "error": clean(exc) or type(exc).__name__, "items": [], "title": name or url}
 
     if d.bozo and not d.entries:
         err = getattr(d, "bozo_exception", "could not parse feed")
-        return {"url": url, "error": str(err), "items": [], "title": name or url}
+        return {"url": url, "error": clean(err) or "could not parse feed", "items": [], "title": name or url}
 
     title = name or d.feed.get("title") or url
     site = d.feed.get("link") or url
@@ -301,7 +393,7 @@ def main() -> int:
     err_html = ""
     if errors:
         rows = "".join(
-            f"<li><code>{html.escape(f['url'])}</code> — {html.escape(str(f['error'])[:200])}</li>"
+            f"<li><code>{html.escape(clean(f['url']))}</code> — {html.escape(clean(f['error'])[:200])}</li>"
             for f in errors
         )
         err_html = f'<div class="err"><strong>{len(errors)} feed(s) failed:</strong><ul>{rows}</ul></div>'
@@ -324,7 +416,7 @@ def main() -> int:
     ok = len(feeds) - len(errors)
     print(f"Built {len(all_items)} items from {ok}/{len(feeds)} feeds into {OUT}/")
     for f in errors:
-        print(f"  ! {f['url']}: {f['error']}", file=sys.stderr)
+        print(f"  ! {clean(f['url'])}: {clean(f['error'])}", file=sys.stderr)
     return 0
 
 
