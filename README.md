@@ -49,3 +49,9 @@ pip install -r requirements.txt
 python build.py
 open site/index.html
 ```
+
+
+# Credits
+Claude Opus 5.5
+
+"can you make rss feed reader that generates a static site for the feed after running in a github action"

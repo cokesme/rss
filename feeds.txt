@@ -1,8 +1,4 @@
 # One feed per line: URL, optionally followed by a display name.
 # Lines starting with # are ignored.
 
-https://hnrss.org/frontpage Hacker News
-https://simonwillison.net/atom/everything/ Simon Willison
-https://jvns.ca/atom.xml Julia Evans
-https://www.theverge.com/rss/index.xml The Verge
-https://xkcd.com/atom.xml xkcd
+https://maggieappleton.com/rss.xml Maggie Hugo
