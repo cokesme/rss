@@ -84,7 +84,7 @@ Untrusted bytes cross three boundaries, and each one has its own controls:
 flowchart TD
     F["feeds.txt (trusted)"] --> D
     subgraph net ["Boundary 1: network (build.py, 8 threads)"]
-        D["download(url)<br/>http(s) only · DNS resolved once, every address checked<br/>connect to the checked address · max 5 redirects<br/>20 s per socket op + 20 s body deadline · 5 MiB cap · no gzip"]
+        D["download(url)<br/>http(s) only · DNS resolved once, every address checked<br/>connect to the checked address · max 5 redirects<br/>20 s per socket op + 20 s body deadline<br/>5 MiB cap before and after gzip/deflate decoding"]
     end
     D -- "bytes + content-location/type" --> P
     subgraph proc ["Boundary 2: parser process (spawned per feed)"]
@@ -119,9 +119,13 @@ flowchart TD
     - IPv4-mapped and 6to4 IPv6 addresses are unwrapped and checked as IPv4.
     - TLS still verifies the hostname (`server_hostname=self.host`).
 - **Redirects:** `SafeRedirectHandler` allows at most 5, and only to http(s).
-- **Limits:** a 20 s socket timeout per operation, plus a 20 s deadline for reading the body. The body is read in chunks and refused past 5 MiB. No `Accept-Encoding` is sent, so a server has no reason to compress.
+- **Limits:** a 20 s socket timeout per operation, plus a 20 s deadline for reading the body. The body is read in chunks and refused past 5 MiB.
+- **Compression:** `download()` sends `Accept-Encoding: gzip, deflate`. `decode_body()` decompresses with `zlib.decompressobj` and a maximum output length, so a decompression bomb is refused after at most 5 MiB of output instead of being expanded in full.
+    - It handles `x-gzip`, multi-member gzip, and raw deflate sent as `deflate`.
+    - Any other encoding, or a truncated or corrupt stream, becomes that feed's error.
+    - A 200 MiB gzip bomb (about 200 KB on the wire) is refused in under 2 s.
 - **Passing the body to feedparser:** as `io.BytesIO(data)`, never raw bytes, because feedparser treats a bytes argument as a file path first (`api.py:118`). We also pass `response_headers` with `content-location` (the final URL), so relative links still resolve, and `content-type`, so the charset is honoured.
-- **Local testing:** `RSS_ALLOW_PRIVATE=1` turns off the address check, for feeds served from your own machine or LAN.
+- **No escape hatch:** the address check can't be turned off. `ALLOW_PRIVATE` is a module flag that only the tests patch, to reach their own loopback server; environment variables don't affect it. A feed served from your own machine or LAN can't be read.
 
 ### 4.3 Parsing in a child process (Dep F3, F4, F5)
 
@@ -170,6 +174,7 @@ Alternatives considered:
     - `<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'">`. GitHub Pages can't set response headers, so a `<meta>` tag is the only option. This blocks scripts, including `javascript:` navigation, even if an escaping bug comes back. The pages need only their inline `<style>`.
     - `<meta name="referrer" content="no-referrer">`. Article links also get `rel="noopener noreferrer"`. Browsers already sent only the origin, so the gain is small.
 - **`atom.xml`:** attribute values escape `"` as `&quot;`, and the file parses with `xml.etree`.
+- **Atom ids:** each entry's `<id>` is computed by `entry_id()` and namespaced by the feed's URL. Before, entries whose link fell back to the same URL shared an id. Namespacing also stops a hostile feed from reusing another feed's entry ids, which some readers use to replace the trusted feed's entries.
 
 ### 4.7 Errors and logs (§3.4.4)
 
@@ -201,7 +206,7 @@ Forcing expat's setting on made the one-line forms leak local file contents. Bec
 | `MAX_REDIRECTS` | 5 | Redirect hops per feed |
 | `PARSE_TIMEOUT` | 20 s | Wall-clock limit for parsing one feed |
 | `PARSE_MEMORY` | 512 MiB | Address-space cap for the parser process (Linux) |
-| `ALLOW_PRIVATE` | `RSS_ALLOW_PRIVATE=1` | Turns off the non-public address check for local testing |
+| `ALLOW_PRIVATE` | `False` | Turns off the non-public address check. Tests only; not configurable. |
 
 ---
 
@@ -209,7 +214,9 @@ Forcing expat's setting on made the one-line forms leak local file contents. Bec
 
 - **Proxies are ignored.** `HTTP(S)_PROXY` no longer applies to feed fetches.
 - **HTTP 4xx/5xx responses become feed errors** (for example "HTTP Error 404") instead of being parsed.
-- **Compressed bodies fail to parse.** A server that sends gzip without being asked now fails to parse instead of being decompressed.
+- **Only gzip and deflate are accepted.** A response in any other `Content-Encoding`, such as `br`, becomes that feed's error.
+- **Private-address feeds can't be read at all.** There is no escape hatch.
+- **Every `atom.xml` entry id changes once.** Ids are now `urn:sha1:` of the feed URL plus the entry's own id, link, or title/date/summary (§4.6). Existing subscribers will see each entry once more after the first deploy.
 - **Each feed costs about 0.2 s more**, to start its parser process. This runs in parallel across the 8 fetch threads.
 - **A hostile feed costs up to 20 s per build** before it is killed, plus up to 20 s of download time.
 - **`strip_html()` keeps literal `<` … `>` text** (§4.4).
@@ -219,11 +226,11 @@ Forcing expat's setting on made the one-line forms leak local file contents. Bec
 
 ## 7. Verification
 
-40 standard-library tests in `tests/` need no network. All of them passed with every DNS lookup and connection to anything except loopback made to fail. They pass on Python 3.12.15 and on 3.13.13 with the hash-pinned install.
+50 standard-library tests in `tests/` need no network. All of them passed with every DNS lookup and connection to anything except loopback made to fail. They pass on Python 3.12.15 and on 3.13.13 with the hash-pinned install.
 
 - `tests/test_render.py` (9): link sanitizing, Atom escaping, CSP and referrer, `strip_html` speed and output.
-- `tests/test_fetch.py` (20): limits, SSRF, redirects, schemes, relative links, charset, `clean()`.
-- `tests/test_parse.py` (11): dates, parser-process timeout and memory cap, external entities.
+- `tests/test_fetch.py` (27): limits, decompression, SSRF, redirects, schemes, relative links, charset, `clean()`, no environment escape hatch.
+- `tests/test_parse.py` (14): dates, parser-process timeout and memory cap, external entities, Atom ids.
 
 The same malicious feeds were replayed before (`0600b1e`) and after, through the real `fetch()` and renderers:
 
@@ -234,7 +241,7 @@ The same malicious feeds were replayed before (`0600b1e`) and after, through the
 | 20,000 unclosed `<script>` in a title | 7.21 s | 0.05 s |
 | 302 redirect to `http://127.0.0.1/internal` | followed; internal title published | refused |
 | Server that never responds | waits until the 6 h job limit | timed out |
-| 6 MiB body / 50 MiB gzip bomb | read or decompressed in memory | refused / not decompressed |
+| 6 MiB body / 200 MiB gzip bomb | read or decompressed in memory | refused / refused after 5 MiB of output, in under 2 s |
 | 68 KB feed with one entity referenced 6,000 times | 887 MiB peak memory | `MemoryError` in 0.1 s |
 | 26 KB XML declaration with repeated `encoding=` | 21 s, all threads stalled | killed at 20 s |
 | Item dated `0000-01-01T00:00:00Z` | whole build aborts | item builds, undated |
@@ -247,7 +254,6 @@ The same malicious feeds were replayed before (`0600b1e`) and after, through the
 - **Slow headers:** a server that drips response headers is bounded only by the per-operation timeout and `http.client`'s header limits. The job's `timeout-minutes` is the backstop.
 - **Connect timeouts add up:** connecting can take up to 20 s for each resolved address.
 - **Some IPv6 forms aren't unwrapped:** NAT64 (`64:ff9b::/96`) and Teredo addresses that embed private IPv4. This only matters on NAT64 networks.
-- **Duplicate Atom IDs:** several entries that fall back to the same channel or feed URL get the same Atom `<id>`. This was true before these changes too.
 - **Unreported upstream bugs:** F3 (cubic XML-declaration regex) and F5 (unbounded entity expansion) aren't in feedparser's tracker. They should be reported to the maintainer privately.
 - **XXE depends on one upstream setting**, now covered by tests (§4.8).
 
@@ -258,7 +264,8 @@ The same malicious feeds were replayed before (`0600b1e`) and after, through the
 RFD 0001 proposes conditional fetching and a persistent archive. If it is implemented, it should build on this RFD:
 
 - **Fetching:** extend `download()` with `If-None-Match` / `If-Modified-Since` and `304` handling. Don't add a second fetcher; RFD 0001's Phase 1 bounded fetcher is `download()`.
-- **Archive bootstrap:** the archive download from the Pages URL should go through `download()`. Its gzip must be decompressed with a size limit, because `download()` doesn't decompress.
+- **Archive bootstrap:** the archive download from the Pages URL should go through `download()`. If the archive file itself is gzipped (rather than served with `Content-Encoding`), decode it with `decode_body()` or the same bounded approach. Its size will also outgrow `MAX_FEED_BYTES` and need its own limit.
+- **Item identity:** RFD 0001's `item_id` should be namespaced by feed URL the same way as `entry_id()` (§4.6), for the same reason.
 - **Archived items are untrusted input:** they come from feeds. Links must go through `sanitize_link()` again at render time, which `render_items()` and `render_atom()` already do. Titles and summaries must stay plain text and be escaped.
 - **Parsing:** merging and parsing should stay inside the parser process so the time and memory limits still apply.
 
@@ -280,3 +287,6 @@ On branch `security-hardening`, based on `e3bd541`:
 | `7cde9f8` | Skip out-of-range entry dates |
 | `8213006` | Parse each feed in a child process with time and memory limits |
 | `fab9f69` | External-entity regression tests |
+| `1ee96a1` | Remove the `RSS_ALLOW_PRIVATE` escape hatch |
+| `1d5d5f1` | Bounded gzip/deflate decoding |
+| `b97b7c9` | Unique, feed-namespaced Atom ids |

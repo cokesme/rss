@@ -151,7 +151,7 @@ concurrency:
 | Run tests on every cron | No new coverage (§3.2), and a flaky test would stop updates. |
 | Add `pull_request` to `build.yml` without splitting concurrency | Any PR could cancel or queue behind a production deploy. |
 | Keep `configure-pages` with `pages: read` | Grants Pages API access to a job that runs untrusted input, for outputs nothing reads. |
-| Test on a 3.12 + 3.13 matrix | Only 3.12 builds the site. 3.13 was checked locally (40/40 with the hash-pinned install). |
+| Test on a 3.12 + 3.13 matrix | Only 3.12 builds the site. 3.13 was checked locally (50/50 with the hash-pinned install). |
 
 ---
 
@@ -159,7 +159,7 @@ concurrency:
 
 - **actionlint 1.7.12:** 0 errors.
 - **Hash-pinned install:** succeeded in fresh venvs on Python 3.12 and 3.13, and `pip check` is clean.
-- **The test job's commands:** `pip install --require-hashes -r requirements.txt` then `python -m unittest discover -s tests -v`. Run locally, all 40 tests passed with every non-loopback DNS lookup and connection blocked, so the suite needs no network on the runner.
+- **The test job's commands:** `pip install --require-hashes -r requirements.txt` then `python -m unittest discover -s tests -v`. Run locally, all 50 tests passed with every non-loopback DNS lookup and connection blocked, so the suite needs no network on the runner.
 - **Job conditions:** the trigger table in §3.1 was worked out from the expressions. It hasn't been seen on GitHub yet.
 
 **Not yet verified:** no run on GitHub. The first real check is opening a PR from `security-hardening`. GitHub runs the PR's own copy of the workflow, so the `test` job will run, and `build` and `deploy` should show as skipped.
