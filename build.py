@@ -5,9 +5,12 @@ from __future__ import annotations
 
 import calendar
 import html
+import io
 import re
 import shutil
 import sys
+import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -24,6 +27,8 @@ MAX_ITEMS = 300          # items on the front page
 MAX_PER_FEED = 50        # items kept per feed
 SUMMARY_CHARS = 280
 USER_AGENT = "static-rss-reader/1.0 (+https://github.com)"
+FETCH_TIMEOUT = 20       # seconds per socket operation, and for the whole body
+MAX_FEED_BYTES = 5 * 1024 * 1024
 
 
 # ---------- helpers ----------
@@ -83,10 +88,28 @@ def read_feed_list() -> list[tuple[str, str | None]]:
 
 # ---------- fetching ----------
 
+def download(url: str) -> tuple[bytes, dict]:
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})  # no Accept-Encoding
+    deadline = time.monotonic() + FETCH_TIMEOUT
+    with urllib.request.urlopen(req, timeout=FETCH_TIMEOUT) as resp:
+        buf = bytearray()
+        while chunk := resp.read1(65536):
+            buf += chunk
+            if len(buf) > MAX_FEED_BYTES:
+                raise ValueError(f"feed exceeds {MAX_FEED_BYTES} bytes")
+            if time.monotonic() > deadline:
+                raise TimeoutError(f"feed download took over {FETCH_TIMEOUT}s")
+        # content-location keeps relative links resolving against the (final) feed URL
+        return bytes(buf), {"content-location": resp.geturl(),
+                            "content-type": resp.headers.get("content-type", "")}
+
+
 def fetch(url_and_name):
     url, name = url_and_name
     try:
-        d = feedparser.parse(url, agent=USER_AGENT)
+        data, headers = download(url)
+        # BytesIO, not bytes: feedparser tries to open() a bytes argument as a local file path
+        d = feedparser.parse(io.BytesIO(data), response_headers=headers)
     except Exception as exc:  # noqa: BLE001
         return {"url": url, "error": str(exc), "items": [], "title": name or url}
 
