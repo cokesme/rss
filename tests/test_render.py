@@ -122,6 +122,7 @@ class TimelineRenderTest(unittest.TestCase):
         self.assertIn('<div class="tl" id="timeline" hidden>', out)
         self.assertIn('id="tl-min"', out)
         self.assertIn('id="tl-track"', out)
+        self.assertIn('id="tl-ticks"', out)
         self.assertIn('id="tl-range"', out)
         self.assertIn('id="tl-start" role="slider" aria-label="Start year"', out)
         self.assertIn('id="tl-end" role="slider" aria-label="End year"', out)
