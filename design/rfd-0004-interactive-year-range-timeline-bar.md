@@ -47,13 +47,13 @@ This RFD proposes adding a compact, resizable **Timeline Range Bar** anchored in
   - **Left column (`.hdr-title`):** Site `<h1>`, last-updated timestamp, and Atom link.
   - **Right column (`.tl`):** The timeline bar widget, displaying:
     - Outer bounds labels: `min_year` on the far left, `max_year` on the far right.
-    - Track (`.tl-track`): Full span from `min_year` to `max_year` with subtle tick marks for intermediate years.
-    - Resizable range selection (`.tl-range`): Highlighted bar (`var(--accent)`) bounded by two draggable edge handles (`.tl-w` on the left, `.tl-e` on the right).
-    - Status readout (`.tl-meta`): e.g. `2023 – 2026 · 142 posts` or `All years (2021 – 2026)`.
+    - Track (`.tl-track`) with year tick segments and mini post-density bars (`.tl-ticks` / `.tl-tick` / `.tl-bar`): Each year in `[min_year .. max_year]` is allocated a full interval whose width blends uniform year width (`25%`) and post-count density (`75%` with `count^0.55` curve and `0.18` floor), giving busy years proportional room to scrub while keeping quiet years clickable.
+    - Resizable range selection (`.tl-range`): Highlighted bar (`var(--accent)`) bounded by two draggable edge handles (`.tl-w` on the left, `.tl-e` on the right), with a smooth `140ms` glide transition when clicking to jump.
+    - Status readout (`.tl-meta`): Displays `Month YYYY – Month YYYY · N posts` (e.g. `Jan 2022 – Oct 2026 · 180 posts`).
 
 ### 3.2 Edge-Case Behavior: Single-Year Feeds
 If `min_year == max_year` (e.g., all posts on the page are from `2026`):
-- Both outer labels show `2026`, the bar renders in a full-width selected state (`2026 · N posts`), and handle dragging is locked so the UI never divides by zero.
+- That single year's interval `[Jan 1, 2026 .. maxTs]` spans the full width of the bar, allowing smooth month-by-month scrubbing across the year without division by zero.
 
 ---
 
@@ -61,12 +61,12 @@ If `min_year == max_year` (e.g., all posts on the page are from `2026`):
 
 ```mermaid
 flowchart LR
-    Init["Page Load"] --> Scan["Scan <article data-year='YYYY'>\nCompute minYear & maxYear"]
-    Scan --> RenderBar["Initialize Upper-Right\nTimeline Bar [minYear .. maxYear]"]
-    RenderBar --> Drag["User Drags Left/Right Edge\nor Pans Selection Bar"]
-    Drag --> Clamp["Clamp startYear <= endYear\nSnap to Year Ticks"]
-    Clamp --> Filter["Toggle hidden on <article>\nand empty <div class='day'>"]
-    Filter --> Count["Update 'Showing X posts (startYear–endYear)'"]
+    Init["Page Load"] --> Scan["Scan <article data-year='YYYY'>\nand <time datetime='...'>"]
+    Scan --> Layout["Compute Density-Weighted Year Segments\n& Render Year Ticks + Density Bars"]
+    Layout --> Drag["Continuous Pixel Drag / Pan\nor Click-to-Jump Upper Edge"]
+    Drag --> Map["Piecewise-Linear Map:\nTrack % -> Exact UTC Timestamp"]
+    Map --> Filter["Toggle hidden on <article>\nand empty <div class='day'>"]
+    Filter --> Count["Update 'Mon YYYY – Mon YYYY · N posts'"]
 ```
 
 ### 4.1 HTML Markup Changes in `build.py`
@@ -97,6 +97,7 @@ flowchart LR
          <div class="tl-row">
            <span class="tl-bound" id="tl-min"></span>
            <div class="tl-track" id="tl-track">
+             <div class="tl-ticks" id="tl-ticks"></div>
              <div class="tl-range" id="tl-range">
                <button type="button" class="tl-handle tl-w" id="tl-start" role="slider" aria-label="Start year"></button>
                <button type="button" class="tl-handle tl-e" id="tl-end" role="slider" aria-label="End year"></button>
@@ -118,50 +119,54 @@ flowchart LR
 
 ```css
 .hdr-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
-.tl{min-width:240px;max-width:300px;user-select:none;touch-action:none}
+.tl{min-width:260px;max-width:340px;user-select:none;touch-action:none}
 .tl-row{display:flex;align-items:center;gap:8px}
 .tl-bound{font-size:.75rem;font-variant-numeric:tabular-nums;color:var(--muted)}
-.tl-track{position:relative;flex:1;height:18px;background:var(--card);border:1px solid var(--line);border-radius:999px;cursor:pointer}
-.tl-range{position:absolute;top:0;bottom:0;left:0%;right:0%;background:color-mix(in srgb,var(--accent) 22%,transparent);border:1.5px solid var(--accent);border-radius:999px;cursor:grab}
+.tl-track{position:relative;flex:1;height:22px;background:var(--card);border:1px solid var(--line);border-radius:999px;cursor:pointer;overflow:visible}
+.tl-ticks{position:absolute;inset:1px;border-radius:999px;overflow:hidden;pointer-events:none}
+.tl-tick{position:absolute;top:0;bottom:0;border-left:1px solid var(--line);display:flex;align-items:flex-end;justify-content:center}
+.tl-tick:first-child{border-left:none}
+.tl-bar{width:100%;background:color-mix(in srgb,var(--muted) 16%,transparent)}
+.tl-range{position:absolute;top:-1px;bottom:-1px;left:0%;right:0%;background:color-mix(in srgb,var(--accent) 22%,transparent);border:1.5px solid var(--accent);border-radius:999px;cursor:grab;z-index:2}
+.tl-range.gliding{transition:left .14s cubic-bezier(.2,.8,.2,1),right .14s cubic-bezier(.2,.8,.2,1)}
 .tl-range:active{cursor:grabbing}
-.tl-handle{position:absolute;top:50%;width:12px;height:18px;padding:0;border:2px solid var(--accent);border-radius:999px;background:var(--bg);transform:translate(-50%,-50%);cursor:ew-resize}
+.tl-handle{position:absolute;top:50%;width:13px;height:20px;padding:0;border:2px solid var(--accent);border-radius:999px;background:var(--bg);transform:translate(-50%,-50%);cursor:ew-resize;z-index:3;transition:transform .1s ease,background .1s ease}
 .tl-handle.tl-w{left:0}
 .tl-handle.tl-e{left:100%}
+.tl-handle:hover,.tl-handle:active{transform:translate(-50%,-50%) scale(1.12);background:var(--card)}
 .tl-handle:focus-visible{outline:2px solid var(--fg);outline-offset:1px}
 .tl-meta{margin-top:4px;text-align:right;font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
 ```
 
 ---
 
-### 4.3 Interaction Mechanics (Resizing, Scrubbing & Click-to-Jump)
+### 4.3 Interaction Mechanics & Density-Weighted Continuous Mapping
 
-The widget supports four gestures using standard Pointer Events (`pointerdown`, `pointermove`, `pointerup` with `setPointerCapture`):
-
-1. **Click on Bar / Track (Jump Upper Edge `endYear`):**
-   - Clicking anywhere on the timeline bar or track (without dragging the left handle `.tl-w` or panning) jumps `endYear` to the clicked year (`yearAt(clientX)`). Because posts are ordered newest-first, setting `endYear` directly controls the year of the first post shown at the top of the page.
-   - If the clicked year is earlier than `startYear`, `startYear` is pulled down to `endYear` so `startYear <= endYear` always holds.
-2. **Resize Left Edge (`.tl-w` handle):**
-   - Dragging adjusts `startYear` within `[minYear, endYear]`.
-   - Left position of `.tl-range` updates to `((startYear - minYear) / span) * 100%`.
-3. **Resize Right Edge (`.tl-e` handle):**
-   - Dragging adjusts `endYear` within `[startYear, maxYear]`.
-   - Right inset of `.tl-range` updates to `((maxYear - endYear) / span) * 100%`.
-4. **Slide / Pan Window (`.tl-range` body):**
-   - Dragging the middle of the bar shifts both `startYear` and `endYear` together while preserving `endYear - startYear` window width.
-5. **Keyboard Accessibility:**
-   - Focusing either handle and pressing `ArrowLeft` / `ArrowRight` decrements/increments that edge by 1 year (`Home` / `End` jumps to `minYear` / `maxYear`), updating `aria-valuemin`, `aria-valuemax`, and `aria-valuenow`.
+1. **Density-Weighted Year Intervals + Continuous Intra-Year Scrubbing:**
+   - Each year $y \in [\text{minYear}, \dots, \text{maxYear}]$ is assigned a weight:
+     $$w_y = 0.25 + 0.75 \cdot \max\left(0.18, \left(\frac{\text{count}_y}{\max_k \text{count}_k}\right)^{0.55}\right)$$
+   - Normalizing $w_y$ partitions the $[0, 1]$ track into contiguous year intervals $[x_0(y), x_1(y)]$.
+   - Within year $y$'s interval $[x_0(y), x_1(y)]$, a normalized cursor position $x \in [x_0(y), x_1(y)]$ maps linearly to an exact UTC timestamp between `Jan 1, y` and `Jan 1, y+1` (or the latest post timestamp in `maxYear`).
+2. **Click on Bar / Track (Jump Upper Edge `sel1` with Glide):**
+   - Clicking anywhere on the timeline bar or track (without dragging `.tl-w` or panning) glides `sel1` to the clicked position (`clientXToNorm(clientX)`), so the newest/first post shown at the top of the page jumps directly to that point in time.
+   - If the clicked point is earlier than `sel0`, `sel0` is pulled down to `sel1 - 0.02`.
+3. **Resize Left/Right Edges & Pan Window:**
+   - Dragging `.tl-w` (`sel0`) or `.tl-e` (`sel1`) tracks the pointer continuously at sub-pixel resolution (`0.01%`).
+   - Dragging `.tl-range` pans `[sel0, sel1]` smoothly across the track while preserving the selection width.
+4. **Keyboard Accessibility:**
+   - Pressing `ArrowLeft` / `ArrowRight` on either handle steps `sel0` or `sel1` by `3%` of the track (`Home` / `End` jumps to the track bounds), updating `aria-valuemin`, `aria-valuemax`, `aria-valuenow`, and `aria-valuetext` (with `Month YYYY`).
 
 ---
 
 ### 4.4 Filtering Logic & Day-Header Cleanup
 
-When `(startYear, endYear)` changes:
-1. Iterate over all `<article data-year="...">` elements:
-   - Parse `y = Number(article.dataset.year)`.
-   - For dated posts, set `article.hidden = !(y >= startYear && y <= endYear)`.
-   - For undated posts (`data-year="undated"`), keep visible when `endYear === maxYear`.
-2. Hide any `<div class="day">` section header whose following `<article>` siblings (up to the next `<div class="day">`) are all `hidden`.
-3. Update `#tl-meta` using `textContent` with the active year range and visible post count (e.g., `2023 – 2025 · 48 posts`).
+When `(sel0, sel1)` changes:
+1. Convert `sel0` and `sel1` to UTC timestamp bounds `(minTs, maxTs)` via the piecewise-linear year map (`xToTs`).
+2. Iterate over all items:
+   - Dated articles are visible when `it.ts >= minTs && it.ts <= maxTs`.
+   - Undated articles (`data-year="undated"`) remain visible when `sel1 >= 0.99`.
+3. Hide any `<div class="day">` section header whose following `<article>` siblings (up to the next `<div class="day">`) are all `hidden`.
+4. Update `#tl-meta` using `textContent` with `Month YYYY – Month YYYY · N posts` (e.g., `Jan 2022 – Oct 2026 · 180 posts`).
 
 ---
 

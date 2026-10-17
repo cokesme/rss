@@ -349,15 +349,21 @@ header h1{margin:0;font-size:1.6rem;letter-spacing:-.01em}
 header h1 a{text-decoration:none}
 header p{margin:4px 0 0;color:var(--muted);font-size:.9rem}
 .hdr-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
-.tl{min-width:240px;max-width:300px;user-select:none;touch-action:none}
+.tl{min-width:260px;max-width:340px;user-select:none;touch-action:none}
 .tl-row{display:flex;align-items:center;gap:8px}
 .tl-bound{font-size:.75rem;font-variant-numeric:tabular-nums;color:var(--muted)}
-.tl-track{position:relative;flex:1;height:18px;background:var(--card);border:1px solid var(--line);border-radius:999px;cursor:pointer}
-.tl-range{position:absolute;top:0;bottom:0;left:0%;right:0%;background:color-mix(in srgb,var(--accent) 22%,transparent);border:1.5px solid var(--accent);border-radius:999px;cursor:grab}
+.tl-track{position:relative;flex:1;height:22px;background:var(--card);border:1px solid var(--line);border-radius:999px;cursor:pointer;overflow:visible}
+.tl-ticks{position:absolute;inset:1px;border-radius:999px;overflow:hidden;pointer-events:none}
+.tl-tick{position:absolute;top:0;bottom:0;border-left:1px solid var(--line);display:flex;align-items:flex-end;justify-content:center}
+.tl-tick:first-child{border-left:none}
+.tl-bar{width:100%;background:color-mix(in srgb,var(--muted) 16%,transparent)}
+.tl-range{position:absolute;top:-1px;bottom:-1px;left:0%;right:0%;background:color-mix(in srgb,var(--accent) 22%,transparent);border:1.5px solid var(--accent);border-radius:999px;cursor:grab;z-index:2}
+.tl-range.gliding{transition:left .14s cubic-bezier(.2,.8,.2,1),right .14s cubic-bezier(.2,.8,.2,1)}
 .tl-range:active{cursor:grabbing}
-.tl-handle{position:absolute;top:50%;width:12px;height:18px;padding:0;border:2px solid var(--accent);border-radius:999px;background:var(--bg);transform:translate(-50%,-50%);cursor:ew-resize}
+.tl-handle{position:absolute;top:50%;width:13px;height:20px;padding:0;border:2px solid var(--accent);border-radius:999px;background:var(--bg);transform:translate(-50%,-50%);cursor:ew-resize;z-index:3;transition:transform .1s ease,background .1s ease}
 .tl-handle.tl-w{left:0}
 .tl-handle.tl-e{left:100%}
+.tl-handle:hover,.tl-handle:active{transform:translate(-50%,-50%) scale(1.12);background:var(--card)}
 .tl-handle:focus-visible{outline:2px solid var(--fg);outline-offset:1px}
 .tl-meta{margin-top:4px;text-align:right;font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
 nav{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
@@ -378,31 +384,82 @@ footer{padding:32px 0 48px;color:var(--muted);font-size:.8rem}
 
 TIMELINE_JS = """(() => {
   const articles = Array.from(document.querySelectorAll("article[data-year]"));
-  const years = articles.map(a => Number(a.dataset.year)).filter(Number.isFinite);
-  if (!years.length) return;
-  const minYear = Math.min(...years), maxYear = Math.max(...years), span = maxYear - minYear;
-  let startYear = minYear, endYear = maxYear, mode = null, moved = false, panStartX = 0, initStart = 0, initEnd = 0;
+  const items = articles.map(a => {
+    const tEl = a.querySelector("time[datetime]");
+    const ts = tEl ? Date.parse(tEl.getAttribute("datetime")) : NaN;
+    const y = Number(a.dataset.year);
+    return { el: a, year: y, ts: Number.isFinite(ts) ? ts : null };
+  });
+  const dated = items.filter(it => Number.isFinite(it.year) && it.ts !== null);
+  if (!dated.length) return;
+  const minYear = Math.min(...dated.map(d => d.year)), maxYear = Math.max(...dated.map(d => d.year));
+  const maxTsInMaxYear = Math.max(...dated.filter(d => d.year === maxYear).map(d => d.ts));
+  const yearList = [];
+  for (let y = minYear; y <= maxYear; y++) {
+    const startTs = Date.UTC(y, 0, 1);
+    const endTs = y === maxYear ? Math.max(Date.UTC(y, 0, 2), maxTsInMaxYear + 1000) : Date.UTC(y + 1, 0, 1);
+    const count = dated.filter(d => d.year === y).length;
+    yearList.push({ year: y, count, startTs, endTs, x0: 0, x1: 1 });
+  }
   const tl = document.getElementById("timeline"), track = document.getElementById("tl-track");
-  const range = document.getElementById("tl-range"), startBtn = document.getElementById("tl-start");
-  const endBtn = document.getElementById("tl-end"), meta = document.getElementById("tl-meta");
+  const ticksEl = document.getElementById("tl-ticks"), range = document.getElementById("tl-range");
+  const startBtn = document.getElementById("tl-start"), endBtn = document.getElementById("tl-end");
+  const meta = document.getElementById("tl-meta");
   document.getElementById("tl-min").textContent = String(minYear);
   document.getElementById("tl-max").textContent = String(maxYear);
   tl.hidden = false;
+  const maxCount = Math.max(1, ...yearList.map(y => y.count));
+  const weights = yearList.map(y => 0.25 + 0.75 * Math.max(0.18, Math.pow(y.count / maxCount, 0.55)));
+  const totalW = weights.reduce((a, b) => a + b, 0) || 1;
+  let acc = 0;
+  yearList.forEach((y, i) => {
+    y.x0 = acc;
+    acc += weights[i] / totalW;
+    y.x1 = i === yearList.length - 1 ? 1 : acc;
+    const d = document.createElement("div");
+    d.className = "tl-tick";
+    d.style.left = (y.x0 * 100) + "%";
+    d.style.width = ((y.x1 - y.x0) * 100) + "%";
+    d.title = y.year + ": " + y.count + " posts";
+    const bar = document.createElement("div");
+    bar.className = "tl-bar";
+    bar.style.height = (y.count ? Math.max(18, Math.round((y.count / maxCount) * 85)) : 0) + "%";
+    d.appendChild(bar);
+    ticksEl.appendChild(d);
+  });
   const days = Array.from(document.querySelectorAll(".day"));
+  const MONTHS = ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"];
+  let sel0 = 0, sel1 = 1, mode = null, moved = false, panStartX = 0, init0 = 0, init1 = 1;
+  function xToTs(x) {
+    const cx = Math.max(0, Math.min(1, x));
+    const seg = yearList.find(y => cx <= y.x1) || yearList[yearList.length - 1];
+    const u = Math.max(0, Math.min(1, (cx - seg.x0) / ((seg.x1 - seg.x0) || 1)));
+    return seg.startTs + u * (seg.endTs - seg.startTs);
+  }
+  function formatEdge(x, isEnd) {
+    if (isEnd && x >= 0.999) return MONTHS[new Date(maxTsInMaxYear).getUTCMonth()] + " " + maxYear;
+    if (!isEnd && x <= 0.001) return "Jan " + minYear;
+    const dt = new Date(xToTs(x));
+    return MONTHS[dt.getUTCMonth()] + " " + dt.getUTCFullYear();
+  }
   function update() {
-    range.style.left = (span ? ((startYear - minYear) / span) * 100 : 0) + "%";
-    range.style.right = (span ? ((maxYear - endYear) / span) * 100 : 0) + "%";
-    startBtn.setAttribute("aria-valuemin", String(minYear));
-    startBtn.setAttribute("aria-valuemax", String(endYear));
-    startBtn.setAttribute("aria-valuenow", String(startYear));
-    endBtn.setAttribute("aria-valuemin", String(startYear));
-    endBtn.setAttribute("aria-valuemax", String(maxYear));
-    endBtn.setAttribute("aria-valuenow", String(endYear));
+    range.style.left = (sel0 * 100).toFixed(2) + "%";
+    range.style.right = ((1 - sel1) * 100).toFixed(2) + "%";
+    const l0 = formatEdge(sel0, false), l1 = formatEdge(sel1, true);
+    startBtn.setAttribute("aria-valuemin", "0");
+    startBtn.setAttribute("aria-valuemax", String(Math.round(sel1 * 100)));
+    startBtn.setAttribute("aria-valuenow", String(Math.round(sel0 * 100)));
+    startBtn.setAttribute("aria-valuetext", l0);
+    endBtn.setAttribute("aria-valuemin", String(Math.round(sel0 * 100)));
+    endBtn.setAttribute("aria-valuemax", "100");
+    endBtn.setAttribute("aria-valuenow", String(Math.round(sel1 * 100)));
+    endBtn.setAttribute("aria-valuetext", l1);
+    const minTs = sel0 <= 0.001 ? -Infinity : xToTs(sel0);
+    const maxTs = sel1 >= 0.999 ? Infinity : xToTs(sel1);
     let visible = 0;
-    for (const a of articles) {
-      const y = Number(a.dataset.year);
-      const show = a.dataset.year === "undated" ? endYear === maxYear : (y >= startYear && y <= endYear);
-      a.hidden = !show;
+    for (const it of items) {
+      const show = it.ts === null ? sel1 >= 0.99 : (it.ts >= minTs && it.ts <= maxTs);
+      it.el.hidden = !show;
       if (show) visible++;
     }
     for (const d of days) {
@@ -413,26 +470,25 @@ TIMELINE_JS = """(() => {
       }
       d.hidden = !any;
     }
-    const label = startYear === endYear ? String(startYear) : startYear + " \\u2013 " + endYear;
-    meta.textContent = label + " \\u00b7 " + visible + " posts";
+    meta.textContent = (l0 === l1 ? l0 : l0 + " \\u2013 " + l1) + " \\u00b7 " + visible + " posts";
   }
-  function yearAt(clientX) {
-    if (!span) return minYear;
+  function clientXToNorm(clientX) {
     const r = track.getBoundingClientRect();
-    const p = Math.max(0, Math.min(1, (clientX - r.left) / (r.width || 1)));
-    return Math.round(minYear + p * span);
+    return Math.max(0, Math.min(1, (clientX - r.left) / (r.width || 1)));
   }
   function jumpEnd(clientX) {
-    endYear = Math.max(minYear, Math.min(maxYear, yearAt(clientX)));
-    if (startYear > endYear) startYear = endYear;
+    range.classList.add("gliding");
+    setTimeout(() => range.classList.remove("gliding"), 160);
+    sel1 = Math.max(0.02, clientXToNorm(clientX));
+    if (sel0 > sel1 - 0.02) sel0 = Math.max(0, sel1 - 0.02);
     update();
   }
   track.addEventListener("pointerdown", e => {
-    if (!span) return;
+    range.classList.remove("gliding");
     if (e.target === startBtn) mode = "start";
     else if (e.target === endBtn) mode = "end";
     else if (e.target === range) {
-      mode = "pan"; moved = false; panStartX = e.clientX; initStart = startYear; initEnd = endYear;
+      mode = "pan"; moved = false; panStartX = e.clientX; init0 = sel0; init1 = sel1;
     } else {
       jumpEnd(e.clientX);
       mode = "end";
@@ -440,17 +496,17 @@ TIMELINE_JS = """(() => {
     track.setPointerCapture(e.pointerId);
   });
   track.addEventListener("pointermove", e => {
-    if (!mode || !span) return;
-    if (mode === "start") startYear = Math.min(endYear, Math.max(minYear, yearAt(e.clientX)));
-    else if (mode === "end") endYear = Math.max(startYear, Math.min(maxYear, yearAt(e.clientX)));
+    if (!mode) return;
+    if (mode === "start") sel0 = Math.min(sel1 - 0.02, clientXToNorm(e.clientX));
+    else if (mode === "end") sel1 = Math.max(sel0 + 0.02, clientXToNorm(e.clientX));
     else if (mode === "pan") {
       if (Math.abs(e.clientX - panStartX) > 3) moved = true;
       if (!moved) return;
       const r = track.getBoundingClientRect();
-      const dy = Math.round(((e.clientX - panStartX) / (r.width || 1)) * span);
-      const w = initEnd - initStart;
-      startYear = Math.max(minYear, Math.min(maxYear - w, initStart + dy));
-      endYear = startYear + w;
+      const dx = (e.clientX - panStartX) / (r.width || 1);
+      const w = init1 - init0;
+      sel0 = Math.max(0, Math.min(1 - w, init0 + dx));
+      sel1 = sel0 + w;
     }
     update();
   });
@@ -459,19 +515,20 @@ TIMELINE_JS = """(() => {
     mode = null;
   });
   track.addEventListener("pointercancel", () => { mode = null; });
+  const step = 0.03;
   startBtn.addEventListener("keydown", e => {
-    if (e.key === "ArrowLeft" || e.key === "ArrowDown") startYear = Math.max(minYear, startYear - 1);
-    else if (e.key === "ArrowRight" || e.key === "ArrowUp") startYear = Math.min(endYear, startYear + 1);
-    else if (e.key === "Home") startYear = minYear;
-    else if (e.key === "End") startYear = endYear;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") sel0 = Math.max(0, sel0 - step);
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") sel0 = Math.min(sel1 - 0.02, sel0 + step);
+    else if (e.key === "Home") sel0 = 0;
+    else if (e.key === "End") sel0 = Math.max(0, sel1 - 0.02);
     else return;
     e.preventDefault(); update();
   });
   endBtn.addEventListener("keydown", e => {
-    if (e.key === "ArrowLeft" || e.key === "ArrowDown") endYear = Math.max(startYear, endYear - 1);
-    else if (e.key === "ArrowRight" || e.key === "ArrowUp") endYear = Math.min(maxYear, endYear + 1);
-    else if (e.key === "Home") endYear = startYear;
-    else if (e.key === "End") endYear = maxYear;
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") sel1 = Math.max(sel0 + 0.02, sel1 - step);
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") sel1 = Math.min(1, sel1 + step);
+    else if (e.key === "Home") sel1 = Math.min(1, sel0 + 0.02);
+    else if (e.key === "End") sel1 = 1;
     else return;
     e.preventDefault(); update();
   });
@@ -512,6 +569,7 @@ def page(title: str, body: str, feeds, active: str | None, now: datetime, depth:
 <div class="tl-row">
 <span class="tl-bound" id="tl-min"></span>
 <div class="tl-track" id="tl-track">
+<div class="tl-ticks" id="tl-ticks"></div>
 <div class="tl-range" id="tl-range">
 <button type="button" class="tl-handle tl-w" id="tl-start" role="slider" aria-label="Start year"></button>
 <button type="button" class="tl-handle tl-e" id="tl-end" role="slider" aria-label="End year"></button>
