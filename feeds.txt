@@ -6,3 +6,4 @@ https://nolanlawson.com/feed/ Nolan Platform chat
 https://www.inkandswitch.com/index.xml Ink and Switch
 https://www.righto.com/feeds/posts/default Ken Cpu
 https://accessvector.net/rss.xml Old Bugs
+https://fly.io/blog/feed.xml Fly.io
