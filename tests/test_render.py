@@ -1,3 +1,6 @@
+import base64
+import hashlib
+import re
 import sys
 import time
 import unittest
@@ -84,12 +87,46 @@ class PageHeadTest(unittest.TestCase):
             with self.subTest(depth=depth):
                 out = build.page("T", "", feeds, None, NOW, depth=depth)
                 head = out.split("</head>", 1)[0]
+                scripts = re.findall(r"<script>(.*?)</script>", out, flags=re.DOTALL)
+                self.assertEqual(len(scripts), 1)
+                expected_sha = base64.b64encode(hashlib.sha256(scripts[0].encode("utf-8")).digest()).decode("ascii")
                 self.assertIn(
                     '<meta http-equiv="Content-Security-Policy" content="default-src \'none\'; '
-                    'style-src \'unsafe-inline\'; base-uri \'none\'; form-action \'none\'">', head)
+                    f'style-src \'unsafe-inline\'; script-src \'sha256-{expected_sha}\'; '
+                    'base-uri \'none\'; form-action \'none\'">', head)
                 self.assertIn('<meta name="referrer" content="no-referrer">', head)
                 self.assertIn("<style>", head)
-                self.assertNotIn("<script", out)
+                self.assertNotIn("innerHTML", scripts[0])
+                self.assertNotIn("eval(", scripts[0])
+
+
+class TimelineRenderTest(unittest.TestCase):
+    def test_article_data_year_and_day_headers(self):
+        items = [
+            item("https://example.com/1", date=datetime(2026, 10, 16, 12, 0, tzinfo=timezone.utc)),
+            item("https://example.com/2", date=datetime(2021, 5, 4, 8, 30, tzinfo=timezone.utc)),
+            item("https://example.com/3", date=None),
+        ]
+        out = build.render_items(items, NOW)
+        self.assertIn('<div class="day">Friday, October 16, 2026</div>', out)
+        self.assertIn('<div class="day">Tuesday, May 04, 2021</div>', out)
+        self.assertIn('<div class="day">Undated</div>', out)
+        self.assertIn('<article data-year="2026">', out)
+        self.assertIn('<article data-year="2021">', out)
+        self.assertIn('<article data-year="undated">', out)
+
+    def test_timeline_markup_in_page(self):
+        feeds = [{"title": "F", "slug": "f", "items": [item("https://example.com/")]}]
+        out = build.page("T", "", feeds, None, NOW)
+        self.assertIn('<div class="hdr-top">', out)
+        self.assertIn('<div class="tl" id="timeline" hidden>', out)
+        self.assertIn('id="tl-min"', out)
+        self.assertIn('id="tl-track"', out)
+        self.assertIn('id="tl-range"', out)
+        self.assertIn('id="tl-start" role="slider" aria-label="Start year"', out)
+        self.assertIn('id="tl-end" role="slider" aria-label="End year"', out)
+        self.assertIn('id="tl-max"', out)
+        self.assertIn('id="tl-meta"', out)
 
 
 class StripHtmlTest(unittest.TestCase):
