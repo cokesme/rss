@@ -4,6 +4,7 @@
 - **Title:** Progressive Feed Fetching and Year-Sharded Archival
 - **Status:** Proposed
 - **Created:** 2026-10-16
+- **Related:** RFD 0002 (security hardening), RFD 0003 (CI test gating and workflow permissions), RFD 0004 (timeline bar)
 
 ---
 
@@ -135,10 +136,8 @@ This guarantees durability without a single automated Git commit.
 ```
 
 #### Item Identity & Deduplication Rules
-1. **Stable Item Key (`item_id`):**
-   ```python
-   item_id = (entry.get("id") or entry.get("link") or f"{feed_url}#{strip_html(entry.get('title', ''))}").strip()
-   ```
+1. **Feed-Namespaced Stable Item Key (`item_id`):**
+   Use the same feed-namespaced SHA-1 `entry_id()` function introduced in RFD 0002 (§4.6, §9), computed from the feed URL plus the entry's own `id`, `link`, or `title`/`date`/`summary`. Namespacing by feed URL prevents a hostile feed from colliding with or overwriting another feed's entries.
 2. **Timestamp Preservation (`first_seen`):**
    - If an upstream feed omits `<pubDate>`/`<updated>`, `build.py` records `first_seen` on the first build that discovers the item and reuses `first_seen` on subsequent builds so undated items do not jump to the top of the front page every hour.
 3. **Merge Semantics:**
@@ -152,14 +151,14 @@ This guarantees durability without a single automated Git commit.
 
 For each feed in `feeds.txt`:
 1. Look up prior `etag` and `last_modified` values from `archive["feeds"].get(url)`.
-2. Send an HTTP request with:
+2. Extend RFD 0002's `download()` function (rather than introducing a second fetcher) to accept optional `etag` and `last_modified` headers:
    - `If-None-Match: <etag>` (if present)
    - `If-Modified-Since: <last_modified>` (if present)
-   - Explicit timeout (`15` seconds) and response size limit (`5 MB`).
+   - Enforces RFD 0002's pinned public-IP checks, `FETCH_TIMEOUT` (20 s), `MAX_REDIRECTS` (5), and `MAX_FEED_BYTES` (5 MiB) before and after gzip/deflate decompression.
 3. Handle the response:
    - **`304 Not Modified`:** Skip XML parsing completely; keep all existing items in `archive["feeds"][url]["items"]` and update `last_success`.
-   - **`200 OK`:** Parse the feed, merge new/updated entries into `archive["feeds"][url]["items"]`, and save the new `ETag` and `Last-Modified` response headers.
-   - **Network/HTTP/Parse Error:** Keep all previously archived items in `archive["feeds"][url]["items"]` so the feed's pages stay online, and record the error message (along with `last_success`) in the status banner.
+   - **`200 OK`:** Parse the feed via `parse_isolated()` (`io.BytesIO(data)` inside the time- and memory-bounded child process from RFD 0002 §4.3), merge new/updated entries into `archive["feeds"][url]["items"]`, and save the new `ETag` and `Last-Modified` response headers.
+   - **Network/HTTP/Parse Error:** Keep all previously archived items in `archive["feeds"][url]["items"]` so the feed's pages stay online, and record the `clean()`-sanitized error message (along with `last_success`) in the status banner.
 
 ---
 
@@ -194,11 +193,11 @@ To keep every HTML file fast to load while preserving multi-year history:
 
 ## 5. GitHub Workflow Integration (`.github/workflows/build.yml`)
 
-The workflow passes the deployed GitHub Pages URL (for fallback bootstrapping) and caches `.cache/archive.json.gz` between runs:
+Following RFD 0003 (§3.4, §9), the `actions/cache` step is pinned to a full commit SHA and placed **only in the `build` job** (never in `test`, so tests stay deterministic and PRs cannot read or write archive caches):
 
 ```yaml
       - name: Restore feed archive cache
-        uses: actions/cache@v4
+        uses: actions/cache@<full-commit-sha> # v4.x.x
         with:
           path: .cache
           key: feed-archive-${{ github.run_id }}
@@ -214,15 +213,27 @@ The workflow passes the deployed GitHub Pages URL (for fallback bootstrapping) a
 
 ---
 
-## 6. Implementation Plan
+## 6. Relationships to Other RFDs
+
+- **RFD 0002 (Security Hardening):**
+  - Conditional fetching extends `download()`, and fallback bootstrapping of `archive.json.gz` from the live Pages URL also goes through `download()` and bounded `decode_body()` (with a dedicated `MAX_ARCHIVE_BYTES` limit).
+  - Restored archive entries are treated as untrusted input: links pass through `sanitize_link()` again at render time, and text fields are HTML/XML-escaped.
+- **RFD 0003 (Test-Gated Deploys & Least Privilege):**
+  - `actions/cache` is SHA-pinned and scoped strictly to the `build` job. Offline unit tests in `tests/` test archive merging, `304 Not Modified` handling, and year-shard rendering using local fixtures without network access.
+- **RFD 0004 (Interactive Year-Range Timeline Scrub Bar):**
+  - Each feed's full archived year span (`min_year` to `max_year`) and `<article data-year="YYYY">` attributes power RFD 0004's upper-right timeline bar, and `site/feeds/<slug>-<year>.html` shards allow RFD 0004 to filter or lazy-load historical years on demand.
+
+---
+
+## 7. Implementation Plan
 
 1. **Phase 1 — Archive Store & Conditional HTTP Fetcher (`build.py`):**
-   - Implement `load_archive()` (reading from `ARCHIVE_CACHE_PATH` with fallback to `ARCHIVE_FALLBACK_URL`) and `save_archive()` (writing both `ARCHIVE_CACHE_PATH` and `site/archive.json.gz`).
-   - Replace `feedparser.parse(url)` with a bounded `urllib.request` fetcher that sends `If-None-Match` / `If-Modified-Since`, enforces timeouts/size limits (per the Security Review), and handles `304 Not Modified`.
+   - Implement `load_archive()` (reading from `ARCHIVE_CACHE_PATH` with fallback to `ARCHIVE_FALLBACK_URL` via `download()` and bounded decompression) and `save_archive()` (writing both `ARCHIVE_CACHE_PATH` and `site/archive.json.gz`).
+   - Extend RFD 0002's `download()` to send `If-None-Match` / `If-Modified-Since` and handle `304 Not Modified`.
 2. **Phase 2 — Item Merging & Retention Policy (`build.py`):**
-   - Merge newly fetched entries with archived entries keyed by stable `item_id`, preserving `first_seen` dates and retaining rolled-off entries.
+   - Merge newly fetched entries with archived entries keyed by RFD 0002's feed-namespaced `entry_id()`, preserving `first_seen` dates and retaining rolled-off entries.
    - Apply `MAX_ARCHIVE_YEARS` and `MAX_ARCHIVE_PER_FEED` pruning if configured.
 3. **Phase 3 — Year-Sharded Rendering (`build.py`):**
    - Generate `site/feeds/<slug>-<year>.html` pages and add the year archive navigation bar to per-feed pages.
 4. **Phase 4 — Workflow Caching (`.github/workflows/build.yml`):**
-   - Add `actions/cache` step and pass `ARCHIVE_CACHE_PATH` and `ARCHIVE_FALLBACK_URL` environment variables to `python build.py`.
+   - Add the SHA-pinned `actions/cache` step in `build` and pass `ARCHIVE_CACHE_PATH` and `ARCHIVE_FALLBACK_URL` environment variables to `python build.py`.

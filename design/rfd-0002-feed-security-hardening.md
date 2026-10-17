@@ -4,7 +4,7 @@
 - **Title:** Hardening Feed Fetching, Parsing and Rendering
 - **Status:** Implemented on branch `security-hardening`, pending review
 - **Created:** 2026-10-16
-- **Related:** RFD 0003 (workflow changes), RFD 0001 (feed archival), `docs/security-review.md`, `docs/security-review-validation.md`, `docs/dependency-review.md`
+- **Related:** RFD 0003 (workflow changes), RFD 0001 (feed archival), RFD 0004 (timeline bar), `docs/security-review.md`, `docs/security-review-validation.md`, `docs/dependency-review.md`
 
 ---
 
@@ -259,7 +259,7 @@ The same malicious feeds were replayed before (`0600b1e`) and after, through the
 
 ---
 
-## 9. Relationship to RFD 0001
+## 9. Relationship to RFD 0001 and RFD 0004
 
 RFD 0001 proposes conditional fetching and a persistent archive. If it is implemented, it should build on this RFD:
 
@@ -268,6 +268,11 @@ RFD 0001 proposes conditional fetching and a persistent archive. If it is implem
 - **Item identity:** RFD 0001's `item_id` should be namespaced by feed URL the same way as `entry_id()` (§4.6), for the same reason.
 - **Archived items are untrusted input:** they come from feeds. Links must go through `sanitize_link()` again at render time, which `render_items()` and `render_atom()` already do. Titles and summaries must stay plain text and be escaped.
 - **Parsing:** merging and parsing should stay inside the parser process so the time and memory limits still apply.
+
+RFD 0004 proposes an interactive year-range timeline bar in the page header:
+
+- **Content Security Policy:** RFD 0004's inline script should be authorized via a build-time `'sha256-...'` hash in `script-src` (rather than `'unsafe-inline'`), so `javascript:` URIs, event-handler attributes, and any injected `<script>` tags remain blocked by the CSP. If RFD 0004 lazy-loads year shard pages from RFD 0001, `connect-src 'self'` is added alongside `default-src 'none'`.
+- **DOM handling:** the timeline script must only read integer `data-year` attributes and update `.hidden`, CSS offsets, and `.textContent`, never `innerHTML` or untrusted feed fields.
 
 ---
 
