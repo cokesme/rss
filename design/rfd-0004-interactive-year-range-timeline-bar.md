@@ -133,19 +133,22 @@ flowchart LR
 
 ---
 
-### 4.3 Interaction Mechanics (Resizing & Scrubbing)
+### 4.3 Interaction Mechanics (Resizing, Scrubbing & Click-to-Jump)
 
-The widget supports three gestures using standard Pointer Events (`pointerdown`, `pointermove`, `pointerup` with `setPointerCapture`):
+The widget supports four gestures using standard Pointer Events (`pointerdown`, `pointermove`, `pointerup` with `setPointerCapture`):
 
-1. **Resize Left Edge (`.tl-w` handle):**
+1. **Click on Bar / Track (Jump Upper Edge `endYear`):**
+   - Clicking anywhere on the timeline bar or track (without dragging the left handle `.tl-w` or panning) jumps `endYear` to the clicked year (`yearAt(clientX)`). Because posts are ordered newest-first, setting `endYear` directly controls the year of the first post shown at the top of the page.
+   - If the clicked year is earlier than `startYear`, `startYear` is pulled down to `endYear` so `startYear <= endYear` always holds.
+2. **Resize Left Edge (`.tl-w` handle):**
    - Dragging adjusts `startYear` within `[minYear, endYear]`.
    - Left position of `.tl-range` updates to `((startYear - minYear) / span) * 100%`.
-2. **Resize Right Edge (`.tl-e` handle):**
+3. **Resize Right Edge (`.tl-e` handle):**
    - Dragging adjusts `endYear` within `[startYear, maxYear]`.
    - Right inset of `.tl-range` updates to `((maxYear - endYear) / span) * 100%`.
-3. **Slide / Pan Window (`.tl-range` body):**
+4. **Slide / Pan Window (`.tl-range` body):**
    - Dragging the middle of the bar shifts both `startYear` and `endYear` together while preserving `endYear - startYear` window width.
-4. **Keyboard Accessibility:**
+5. **Keyboard Accessibility:**
    - Focusing either handle and pressing `ArrowLeft` / `ArrowRight` decrements/increments that edge by 1 year (`Home` / `End` jumps to `minYear` / `maxYear`), updating `aria-valuemin`, `aria-valuemax`, and `aria-valuenow`.
 
 ---

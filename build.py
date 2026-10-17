@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import base64
 import calendar
 import hashlib
 import html
@@ -347,6 +348,18 @@ header{border-bottom:1px solid var(--line);padding:28px 0 18px;margin-bottom:8px
 header h1{margin:0;font-size:1.6rem;letter-spacing:-.01em}
 header h1 a{text-decoration:none}
 header p{margin:4px 0 0;color:var(--muted);font-size:.9rem}
+.hdr-top{display:flex;justify-content:space-between;align-items:flex-start;gap:16px;flex-wrap:wrap}
+.tl{min-width:240px;max-width:300px;user-select:none;touch-action:none}
+.tl-row{display:flex;align-items:center;gap:8px}
+.tl-bound{font-size:.75rem;font-variant-numeric:tabular-nums;color:var(--muted)}
+.tl-track{position:relative;flex:1;height:18px;background:var(--card);border:1px solid var(--line);border-radius:999px;cursor:pointer}
+.tl-range{position:absolute;top:0;bottom:0;left:0%;right:0%;background:color-mix(in srgb,var(--accent) 22%,transparent);border:1.5px solid var(--accent);border-radius:999px;cursor:grab}
+.tl-range:active{cursor:grabbing}
+.tl-handle{position:absolute;top:50%;width:12px;height:18px;padding:0;border:2px solid var(--accent);border-radius:999px;background:var(--bg);transform:translate(-50%,-50%);cursor:ew-resize}
+.tl-handle.tl-w{left:0}
+.tl-handle.tl-e{left:100%}
+.tl-handle:focus-visible{outline:2px solid var(--fg);outline-offset:1px}
+.tl-meta{margin-top:4px;text-align:right;font-size:.75rem;color:var(--muted);font-variant-numeric:tabular-nums}
 nav{display:flex;flex-wrap:wrap;gap:6px;margin-top:14px}
 nav a{font-size:.82rem;text-decoration:none;padding:3px 10px;border:1px solid var(--line);border-radius:999px;color:var(--muted);background:var(--card)}
 nav a:hover,nav a.on{color:var(--accent);border-color:var(--accent)}
@@ -363,8 +376,113 @@ article h2 a:hover{color:var(--accent)}
 footer{padding:32px 0 48px;color:var(--muted);font-size:.8rem}
 """
 
+TIMELINE_JS = """(() => {
+  const articles = Array.from(document.querySelectorAll("article[data-year]"));
+  const years = articles.map(a => Number(a.dataset.year)).filter(Number.isFinite);
+  if (!years.length) return;
+  const minYear = Math.min(...years), maxYear = Math.max(...years), span = maxYear - minYear;
+  let startYear = minYear, endYear = maxYear, mode = null, moved = false, panStartX = 0, initStart = 0, initEnd = 0;
+  const tl = document.getElementById("timeline"), track = document.getElementById("tl-track");
+  const range = document.getElementById("tl-range"), startBtn = document.getElementById("tl-start");
+  const endBtn = document.getElementById("tl-end"), meta = document.getElementById("tl-meta");
+  document.getElementById("tl-min").textContent = String(minYear);
+  document.getElementById("tl-max").textContent = String(maxYear);
+  tl.hidden = false;
+  const days = Array.from(document.querySelectorAll(".day"));
+  function update() {
+    range.style.left = (span ? ((startYear - minYear) / span) * 100 : 0) + "%";
+    range.style.right = (span ? ((maxYear - endYear) / span) * 100 : 0) + "%";
+    startBtn.setAttribute("aria-valuemin", String(minYear));
+    startBtn.setAttribute("aria-valuemax", String(endYear));
+    startBtn.setAttribute("aria-valuenow", String(startYear));
+    endBtn.setAttribute("aria-valuemin", String(startYear));
+    endBtn.setAttribute("aria-valuemax", String(maxYear));
+    endBtn.setAttribute("aria-valuenow", String(endYear));
+    let visible = 0;
+    for (const a of articles) {
+      const y = Number(a.dataset.year);
+      const show = a.dataset.year === "undated" ? endYear === maxYear : (y >= startYear && y <= endYear);
+      a.hidden = !show;
+      if (show) visible++;
+    }
+    for (const d of days) {
+      let el = d.nextElementSibling, any = false;
+      while (el && !el.classList.contains("day")) {
+        if (el.tagName === "ARTICLE" && !el.hidden) { any = true; break; }
+        el = el.nextElementSibling;
+      }
+      d.hidden = !any;
+    }
+    const label = startYear === endYear ? String(startYear) : startYear + " \\u2013 " + endYear;
+    meta.textContent = label + " \\u00b7 " + visible + " posts";
+  }
+  function yearAt(clientX) {
+    if (!span) return minYear;
+    const r = track.getBoundingClientRect();
+    const p = Math.max(0, Math.min(1, (clientX - r.left) / (r.width || 1)));
+    return Math.round(minYear + p * span);
+  }
+  function jumpEnd(clientX) {
+    endYear = Math.max(minYear, Math.min(maxYear, yearAt(clientX)));
+    if (startYear > endYear) startYear = endYear;
+    update();
+  }
+  track.addEventListener("pointerdown", e => {
+    if (!span) return;
+    if (e.target === startBtn) mode = "start";
+    else if (e.target === endBtn) mode = "end";
+    else if (e.target === range) {
+      mode = "pan"; moved = false; panStartX = e.clientX; initStart = startYear; initEnd = endYear;
+    } else {
+      jumpEnd(e.clientX);
+      mode = "end";
+    }
+    track.setPointerCapture(e.pointerId);
+  });
+  track.addEventListener("pointermove", e => {
+    if (!mode || !span) return;
+    if (mode === "start") startYear = Math.min(endYear, Math.max(minYear, yearAt(e.clientX)));
+    else if (mode === "end") endYear = Math.max(startYear, Math.min(maxYear, yearAt(e.clientX)));
+    else if (mode === "pan") {
+      if (Math.abs(e.clientX - panStartX) > 3) moved = true;
+      if (!moved) return;
+      const r = track.getBoundingClientRect();
+      const dy = Math.round(((e.clientX - panStartX) / (r.width || 1)) * span);
+      const w = initEnd - initStart;
+      startYear = Math.max(minYear, Math.min(maxYear - w, initStart + dy));
+      endYear = startYear + w;
+    }
+    update();
+  });
+  track.addEventListener("pointerup", e => {
+    if (mode === "pan" && !moved) jumpEnd(e.clientX);
+    mode = null;
+  });
+  track.addEventListener("pointercancel", () => { mode = null; });
+  startBtn.addEventListener("keydown", e => {
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") startYear = Math.max(minYear, startYear - 1);
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") startYear = Math.min(endYear, startYear + 1);
+    else if (e.key === "Home") startYear = minYear;
+    else if (e.key === "End") startYear = endYear;
+    else return;
+    e.preventDefault(); update();
+  });
+  endBtn.addEventListener("keydown", e => {
+    if (e.key === "ArrowLeft" || e.key === "ArrowDown") endYear = Math.max(startYear, endYear - 1);
+    else if (e.key === "ArrowRight" || e.key === "ArrowUp") endYear = Math.min(maxYear, endYear + 1);
+    else if (e.key === "Home") endYear = startYear;
+    else if (e.key === "End") endYear = maxYear;
+    else return;
+    e.preventDefault(); update();
+  });
+  update();
+})();"""
 
-CSP = "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'"
+TIMELINE_SHA256 = base64.b64encode(hashlib.sha256(TIMELINE_JS.encode("utf-8")).digest()).decode("ascii")
+CSP = (
+    "default-src 'none'; style-src 'unsafe-inline'; "
+    f"script-src 'sha256-{TIMELINE_SHA256}'; base-uri 'none'; form-action 'none'"
+)
 
 
 def page(title: str, body: str, feeds, active: str | None, now: datetime, depth: int = 0) -> str:
@@ -385,20 +503,37 @@ def page(title: str, body: str, feeds, active: str | None, now: datetime, depth:
 <style>{CSS}</style>
 </head><body><div class="wrap">
 <header>
+<div class="hdr-top">
+<div class="hdr-title">
 <h1><a href="{up}index.html">{html.escape(SITE_TITLE)}</a></h1>
 <p>Updated {now.strftime("%a %b %d, %Y %H:%M UTC")} · <a href="{up}atom.xml">Atom feed</a></p>
+</div>
+<div class="tl" id="timeline" hidden>
+<div class="tl-row">
+<span class="tl-bound" id="tl-min"></span>
+<div class="tl-track" id="tl-track">
+<div class="tl-range" id="tl-range">
+<button type="button" class="tl-handle tl-w" id="tl-start" role="slider" aria-label="Start year"></button>
+<button type="button" class="tl-handle tl-e" id="tl-end" role="slider" aria-label="End year"></button>
+</div>
+</div>
+<span class="tl-bound" id="tl-max"></span>
+</div>
+<div class="tl-meta" id="tl-meta"></div>
+</div>
+</div>
 <nav>{"".join(chips)}</nav>
 </header>
 <main>{body}</main>
 <footer>Built by a GitHub Action.</footer>
-</div></body></html>"""
+</div><script>{TIMELINE_JS}</script></body></html>"""
 
 
 def render_items(items, now: datetime, show_feed=True, depth=0) -> str:
     out, last_day = [], None
     up = "../" * depth
     for it in items:
-        day = it["date"].strftime("%A, %B %d") if it["date"] else "Undated"
+        day = it["date"].strftime("%A, %B %d, %Y") if it["date"] else "Undated"
         if day != last_day:
             out.append(f'<div class="day">{day}</div>')
             last_day = day
@@ -409,8 +544,9 @@ def render_items(items, now: datetime, show_feed=True, depth=0) -> str:
             iso = it["date"].isoformat()
             meta.append(f'<time datetime="{iso}">{rel_time(it["date"], now)}</time>')
         summary = f'<p class="sum">{html.escape(it["summary"])}</p>' if it["summary"] else ""
+        year = str(it["date"].year) if it["date"] else "undated"
         out.append(
-            f'<article><h2><a href="{html.escape(sanitize_link(it["link"]), quote=True)}" rel="noopener noreferrer">'
+            f'<article data-year="{year}"><h2><a href="{html.escape(sanitize_link(it["link"]), quote=True)}" rel="noopener noreferrer">'
             f'{html.escape(it["title"])}</a></h2>'
             f'<div class="meta">{" · ".join(meta)}</div>{summary}</article>'
         )
