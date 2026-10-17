@@ -4,7 +4,7 @@
 - **Title:** Test-Gated Deploys and a Least-Privilege Build Workflow
 - **Status:** Implemented on branch `security-hardening`, pending review. Not yet run on GitHub.
 - **Created:** 2026-10-16
-- **Related:** RFD 0002 (security hardening), RFD 0001 (feed archival), `docs/security-review.md` §3.4
+- **Related:** RFD 0002 (security hardening), RFD 0001 (feed archival), RFD 0004 (timeline bar), `docs/security-review.md` §3.4
 
 ---
 
@@ -194,7 +194,7 @@ These can't be set from the workflow file:
 
 ---
 
-## 9. Relationship to RFD 0001
+## 9. Relationship to RFD 0001 and RFD 0004
 
 RFD 0001 adds an `actions/cache` step to persist `archive.json.gz`. If it is implemented:
 
@@ -202,6 +202,10 @@ RFD 0001 adds an `actions/cache` step to persist `archive.json.gz`. If it is imp
 - **Put the step in `build` only, never in `test`.** Tests must not depend on archive state, and PR runs must not save it.
 - **Treat a restored archive as untrusted input.** It contains feed-derived content, and may be restored from a cache that another run wrote. RFD 0002 §9 covers how to handle it.
 - **The Pages-URL fallback download** in `build.py` must go through `download()`. That means the fallback URL is fetched under the same address checks and limits as every feed.
+
+RFD 0004 adds an interactive year-range timeline bar to rendered pages. If it is implemented:
+
+- **Cover its rendered output in `tests/test_render.py`,** including `<article data-year="...">` attributes and verifying that the `'sha256-...'` script hash in the CSP `<meta>` tag matches the embedded `<script>` block, so the `test` job gates any broken CSP hash before deploy.
 
 ---
 
